@@ -1,0 +1,103 @@
+name: ESTKme Red stock relay
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: estk-red-stock-relay
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch and parse stock
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p estk-monitor
+          TMP="$(mktemp)"
+          OUT="estk-monitor/status.json"
+          NOW="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          if curl --fail --silent --show-error --location \
+            --connect-timeout 15 --max-time 30 \
+            -H 'Accept: application/json' \
+            -H 'User-Agent: Mozilla/5.0 ESTK-stock-monitor/1.0' \
+            'https://api.estk.me/user/shop/products/2' > "$TMP"; then
+
+            python3 - "$TMP" "$OUT" "$NOW" <<'PY'
+import json, sys
+src, out, now = sys.argv[1:]
+with open(src, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+
+product = data.get('product') if isinstance(data, dict) else None
+items = product.get('items', []) if isinstance(product, dict) else []
+item = next((x for x in items if isinstance(x, dict) and x.get('title') == 'ESTKme Red'), None)
+if item is None:
+    raise SystemExit('ESTKme Red not found in product.items')
+
+result = {
+    'product': 'ESTKme Red',
+    'source': 'https://api.estk.me/user/shop/products/2',
+    'fetch_ok': True,
+    'stock': item.get('stock'),
+    'status': item.get('status'),
+    'is_presale': item.get('is_presale'),
+    'price': item.get('price'),
+    'checked_at': now,
+    'note': 'ok'
+}
+with open(out, 'w', encoding='utf-8') as f:
+    json.dump(result, f, ensure_ascii=False, indent=2)
+    f.write('\n')
+PY
+          else
+            python3 - "$OUT" "$NOW" <<'PY'
+import json, os, sys
+out, now = sys.argv[1:]
+prev = {}
+if os.path.exists(out):
+    try:
+        with open(out, 'r', encoding='utf-8') as f:
+            prev = json.load(f)
+    except Exception:
+        prev = {}
+result = {
+    'product': 'ESTKme Red',
+    'source': 'https://api.estk.me/user/shop/products/2',
+    'fetch_ok': False,
+    'stock': prev.get('stock'),
+    'status': prev.get('status'),
+    'is_presale': prev.get('is_presale'),
+    'price': prev.get('price'),
+    'checked_at': now,
+    'note': 'upstream fetch failed; retained last known values'
+}
+with open(out, 'w', encoding='utf-8') as f:
+    json.dump(result, f, ensure_ascii=False, indent=2)
+    f.write('\n')
+PY
+          fi
+
+      - name: Commit relay status
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add estk-monitor/status.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'Update ESTKme Red stock status'
+          git push
