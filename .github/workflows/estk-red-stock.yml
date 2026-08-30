@@ -1,6 +1,10 @@
 name: ESTKme Red stock relay
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/estk-red-stock.yml'
   schedule:
     - cron: '17 * * * *'
   workflow_dispatch:
