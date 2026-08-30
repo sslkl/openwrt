@@ -1,19 +1,123 @@
-name: ESTKme Red stock relay (manual diagnostic only)
+name: ESTKme Red Oracle status relay
 
 on:
+  schedule:
+    - cron: "17 * * * *"
   workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/estk-red-stock.yml
 
 permissions:
   contents: read
+  statuses: write
+
+concurrency:
+  group: estk-red-oracle-status-relay
+  cancel-in-progress: false
 
 jobs:
-  diagnostic:
+  relay:
     runs-on: ubuntu-latest
     timeout-minutes: 4
+    env:
+      ORACLE_STATUS_URL: http://165.1.76.90/estk-monitor/status.json
     steps:
-      - uses: actions/checkout@v4
-      - name: Explain status
+      - name: Fetch, validate, and publish commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          echo 'Automatic cloud polling is intentionally disabled.'
-          echo 'ESTK returns HTTP 403 / fetch failures to GitHub-hosted cloud runners.'
-          echo 'Use estk-monitor/local_check.sh from a residential/home-network host instead.'
+          set -euo pipefail
+          relay_dir="$(mktemp -d)"
+          fetch_error=""
+
+          if ! curl --fail --silent --show-error --location \
+            --connect-timeout 10 --max-time 30 \
+            --retry 2 --retry-delay 2 --retry-all-errors \
+            --max-filesize 65536 \
+            --output "$relay_dir/status.json" \
+            "$ORACLE_STATUS_URL"; then
+            fetch_error="fetch_failed"
+            printf '{}\n' > "$relay_dir/status.json"
+          fi
+
+          python3 - "$relay_dir/status.json" "$relay_dir/payload.json" "$fetch_error" <<'PY'
+          import json
+          import sys
+          from datetime import datetime, timezone
+
+          source_path, payload_path, fetch_error = sys.argv[1:]
+          now = datetime.now(timezone.utc)
+
+          def fail(reason):
+              description = f"error|reason={reason}|relay={now.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+              return {"state": "error", "context": "estkme-red/oracle-monitor", "description": description[:140]}
+
+          if fetch_error:
+              payload = fail(fetch_error)
+          else:
+              try:
+                  with open(source_path, encoding="utf-8") as handle:
+                      status = json.load(handle)
+                  if status.get("schema_version") != 1 or status.get("monitor") != "estkme-red":
+                      raise ValueError("schema")
+                  checked_at = status["checked_at"]
+                  checked = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+                  age = (now - checked).total_seconds()
+                  if age > 7200 or age < -300:
+                      raise ValueError("stale")
+
+                  monitor_status = status.get("monitor_status")
+                  event = str(status.get("event", "none"))
+                  sequence = int(status.get("event_sequence", 0))
+                  if monitor_status == "error":
+                      failures = int(status.get("consecutive_failures", 0))
+                      description = (
+                          f"error|failures={failures}|checked={checked_at}|"
+                          f"event={event}|seq={sequence}"
+                      )
+                      payload = {
+                          "state": "error",
+                          "context": "estkme-red/oracle-monitor",
+                          "description": description[:140],
+                      }
+                  elif monitor_status == "ok":
+                      product = status["product"]
+                      if product.get("title") != "ESTKme Red":
+                          raise ValueError("product")
+                      stock = int(product["stock"])
+                      if stock < 0 or isinstance(product["stock"], bool):
+                          raise ValueError("stock")
+                      product_status = product["status"]
+                      presale = str(product["is_presale"]).lower()
+                      price = str(product["price"])
+                      description = (
+                          f"ok|stock={stock}|status={product_status}|presale={presale}|"
+                          f"price={price}|checked={checked_at}|event={event}|seq={sequence}"
+                      )
+                      payload = {
+                          "state": "success",
+                          "context": "estkme-red/oracle-monitor",
+                          "description": description[:140],
+                      }
+                  else:
+                      raise ValueError("monitor_status")
+              except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                  payload = fail("invalid_or_stale_status")
+
+          with open(payload_path, "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, separators=(",", ":"))
+          PY
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --header "Content-Type: application/json" \
+            --data-binary "@$relay_dir/payload.json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            >/dev/null
