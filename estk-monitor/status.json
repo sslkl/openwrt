@@ -1,11 +1,11 @@
 {
   "product": "ESTKme Red",
   "source": "https://api.estk.me/user/shop/products/2",
-  "fetch_ok": false,
-  "stock": null,
-  "status": null,
-  "is_presale": null,
-  "price": null,
-  "checked_at": "2026-08-30T12:06:43Z",
-  "note": "browser fetch failed; retained last known values: RuntimeError: browser fetch HTTP 0: TypeError: Failed to fetch"
+  "fetch_ok": true,
+  "stock": 0,
+  "status": 1,
+  "is_presale": false,
+  "price": "60.00",
+  "checked_at": "2026-08-30T12:08:48Z",
+  "note": "ok via Jina browser relay"
 }
