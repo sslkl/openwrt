@@ -20,14 +20,11 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 4
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Selenium
-        run: python3 -m pip install --quiet selenium
-
-      - name: Fetch stock through Chromium
+      - name: Fetch ESTK stock
         run: python3 estk-monitor/check.py
 
       - name: Commit relay status
