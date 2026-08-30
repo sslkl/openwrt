@@ -6,6 +6,6 @@
   "status": null,
   "is_presale": null,
   "price": null,
-  "checked_at": "2026-08-30T12:05:00Z",
-  "note": "upstream fetch failed; retained last known values"
+  "checked_at": "2026-08-30T12:06:43Z",
+  "note": "browser fetch failed; retained last known values: RuntimeError: browser fetch HTTP 0: TypeError: Failed to fetch"
 }
