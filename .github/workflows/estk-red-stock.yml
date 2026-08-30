@@ -7,7 +7,7 @@ on:
       - '.github/workflows/estk-red-stock.yml'
       - 'estk-monitor/check.py'
   schedule:
-    - cron: '17 * * * *'
+    - cron: '2 * * * *'
   workflow_dispatch:
 
 permissions:
