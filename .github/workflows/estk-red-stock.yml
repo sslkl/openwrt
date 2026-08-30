@@ -30,68 +30,47 @@ jobs:
           mkdir -p estk-monitor
           TMP="$(mktemp)"
           OUT="estk-monitor/status.json"
+          NEW="$(mktemp)"
           NOW="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          URL='https://api.estk.me/user/shop/products/2'
 
           if curl --fail --silent --show-error --location \
             --connect-timeout 15 --max-time 30 \
             -H 'Accept: application/json' \
             -H 'User-Agent: Mozilla/5.0 ESTK-stock-monitor/1.0' \
-            'https://api.estk.me/user/shop/products/2' > "$TMP"; then
+            "$URL" > "$TMP"; then
 
-            python3 - "$TMP" "$OUT" "$NOW" <<'PY'
-import json, sys
-src, out, now = sys.argv[1:]
-with open(src, 'r', encoding='utf-8') as f:
-    data = json.load(f)
+            ITEM="$(jq -c '.product.items[]? | select(.title == "ESTKme Red")' "$TMP" | head -n 1)"
+            if [ -z "$ITEM" ]; then
+              echo 'ESTKme Red not found in product.items' >&2
+              exit 1
+            fi
 
-product = data.get('product') if isinstance(data, dict) else None
-items = product.get('items', []) if isinstance(product, dict) else []
-item = next((x for x in items if isinstance(x, dict) and x.get('title') == 'ESTKme Red'), None)
-if item is None:
-    raise SystemExit('ESTKme Red not found in product.items')
-
-result = {
-    'product': 'ESTKme Red',
-    'source': 'https://api.estk.me/user/shop/products/2',
-    'fetch_ok': True,
-    'stock': item.get('stock'),
-    'status': item.get('status'),
-    'is_presale': item.get('is_presale'),
-    'price': item.get('price'),
-    'checked_at': now,
-    'note': 'ok'
-}
-with open(out, 'w', encoding='utf-8') as f:
-    json.dump(result, f, ensure_ascii=False, indent=2)
-    f.write('\n')
-PY
+            jq -n \
+              --arg product 'ESTKme Red' \
+              --arg source "$URL" \
+              --arg checked_at "$NOW" \
+              --argjson item "$ITEM" \
+              '{product:$product,source:$source,fetch_ok:true,stock:$item.stock,status:$item.status,is_presale:$item.is_presale,price:$item.price,checked_at:$checked_at,note:"ok"}' \
+              > "$NEW"
           else
-            python3 - "$OUT" "$NOW" <<'PY'
-import json, os, sys
-out, now = sys.argv[1:]
-prev = {}
-if os.path.exists(out):
-    try:
-        with open(out, 'r', encoding='utf-8') as f:
-            prev = json.load(f)
-    except Exception:
-        prev = {}
-result = {
-    'product': 'ESTKme Red',
-    'source': 'https://api.estk.me/user/shop/products/2',
-    'fetch_ok': False,
-    'stock': prev.get('stock'),
-    'status': prev.get('status'),
-    'is_presale': prev.get('is_presale'),
-    'price': prev.get('price'),
-    'checked_at': now,
-    'note': 'upstream fetch failed; retained last known values'
-}
-with open(out, 'w', encoding='utf-8') as f:
-    json.dump(result, f, ensure_ascii=False, indent=2)
-    f.write('\n')
-PY
+            if [ -s "$OUT" ] && jq -e . "$OUT" >/dev/null 2>&1; then
+              jq \
+                --arg checked_at "$NOW" \
+                '.fetch_ok=false | .checked_at=$checked_at | .note="upstream fetch failed; retained last known values"' \
+                "$OUT" > "$NEW"
+            else
+              jq -n \
+                --arg product 'ESTKme Red' \
+                --arg source "$URL" \
+                --arg checked_at "$NOW" \
+                '{product:$product,source:$source,fetch_ok:false,stock:null,status:null,is_presale:null,price:null,checked_at:$checked_at,note:"upstream fetch failed; no prior value"}' \
+                > "$NEW"
+            fi
           fi
+
+          mv "$NEW" "$OUT"
+          cat "$OUT"
 
       - name: Commit relay status
         shell: bash
