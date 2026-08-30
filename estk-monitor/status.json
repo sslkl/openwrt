@@ -6,6 +6,6 @@
   "status": null,
   "is_presale": null,
   "price": null,
-  "checked_at": null,
-  "note": "relay initialized; waiting for first workflow run"
+  "checked_at": "2026-08-30T12:04:02Z",
+  "note": "upstream fetch failed; retained last known values"
 }
