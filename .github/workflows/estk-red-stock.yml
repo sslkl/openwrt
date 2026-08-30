@@ -5,6 +5,7 @@ on:
     branches: [master]
     paths:
       - '.github/workflows/estk-red-stock.yml'
+      - 'estk-monitor/check.py'
   schedule:
     - cron: '17 * * * *'
   workflow_dispatch:
@@ -19,64 +20,15 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch and parse stock
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p estk-monitor
-          TMP="$(mktemp)"
-          OUT="estk-monitor/status.json"
-          NEW="$(mktemp)"
-          NOW="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          URL='https://api.estk.me/user/shop/products/2'
+      - name: Install Selenium
+        run: python3 -m pip install --quiet selenium
 
-          if curl --fail --silent --show-error --location \
-            --connect-timeout 15 --max-time 30 \
-            -H 'Accept: */*' \
-            -H 'Content-Type: application/json' \
-            -H 'Origin: https://store.estk.me' \
-            -H 'Referer: https://store.estk.me/' \
-            -H 'Sec-Fetch-Dest: empty' \
-            -H 'Sec-Fetch-Mode: cors' \
-            -H 'Sec-Fetch-Site: same-site' \
-            -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36' \
-            "$URL" > "$TMP"; then
-
-            ITEM="$(jq -c '((.data.product.items // .product.items // [])[]) | select(.title == "ESTKme Red")' "$TMP" | head -n 1)"
-            if [ -z "$ITEM" ]; then
-              echo 'ESTKme Red not found in data.product.items or product.items' >&2
-              exit 1
-            fi
-
-            jq -n \
-              --arg product 'ESTKme Red' \
-              --arg source "$URL" \
-              --arg checked_at "$NOW" \
-              --argjson item "$ITEM" \
-              '{product:$product,source:$source,fetch_ok:true,stock:$item.stock,status:$item.status,is_presale:$item.is_presale,price:$item.price,checked_at:$checked_at,note:"ok"}' \
-              > "$NEW"
-          else
-            if [ -s "$OUT" ] && jq -e . "$OUT" >/dev/null 2>&1; then
-              jq \
-                --arg checked_at "$NOW" \
-                '.fetch_ok=false | .checked_at=$checked_at | .note="upstream fetch failed; retained last known values"' \
-                "$OUT" > "$NEW"
-            else
-              jq -n \
-                --arg product 'ESTKme Red' \
-                --arg source "$URL" \
-                --arg checked_at "$NOW" \
-                '{product:$product,source:$source,fetch_ok:false,stock:null,status:null,is_presale:null,price:null,checked_at:$checked_at,note:"upstream fetch failed; no prior value"}' \
-                > "$NEW"
-            fi
-          fi
-
-          mv "$NEW" "$OUT"
-          cat "$OUT"
+      - name: Fetch stock through Chromium
+        run: python3 estk-monitor/check.py
 
       - name: Commit relay status
         shell: bash
