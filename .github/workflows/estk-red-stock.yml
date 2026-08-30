@@ -36,13 +36,19 @@ jobs:
 
           if curl --fail --silent --show-error --location \
             --connect-timeout 15 --max-time 30 \
-            -H 'Accept: application/json' \
-            -H 'User-Agent: Mozilla/5.0 ESTK-stock-monitor/1.0' \
+            -H 'Accept: */*' \
+            -H 'Content-Type: application/json' \
+            -H 'Origin: https://store.estk.me' \
+            -H 'Referer: https://store.estk.me/' \
+            -H 'Sec-Fetch-Dest: empty' \
+            -H 'Sec-Fetch-Mode: cors' \
+            -H 'Sec-Fetch-Site: same-site' \
+            -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36' \
             "$URL" > "$TMP"; then
 
-            ITEM="$(jq -c '.product.items[]? | select(.title == "ESTKme Red")' "$TMP" | head -n 1)"
+            ITEM="$(jq -c '((.data.product.items // .product.items // [])[]) | select(.title == "ESTKme Red")' "$TMP" | head -n 1)"
             if [ -z "$ITEM" ]; then
-              echo 'ESTKme Red not found in product.items' >&2
+              echo 'ESTKme Red not found in data.product.items or product.items' >&2
               exit 1
             fi
 
