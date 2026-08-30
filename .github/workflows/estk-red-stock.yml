@@ -2,7 +2,7 @@ name: ESTKme Red Oracle status relay
 
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
   push:
     branches:
@@ -24,6 +24,7 @@ jobs:
     timeout-minutes: 4
     env:
       ORACLE_STATUS_URL: http://165.1.76.90/estk-monitor/status.json
+      STATUS_CONTEXT: estkme-red/oracle-monitor
     steps:
       - name: Fetch, validate, and publish commit status
         env:
@@ -44,17 +45,75 @@ jobs:
             printf '{}\n' > "$relay_dir/status.json"
           fi
 
-          python3 - "$relay_dir/status.json" "$relay_dir/payload.json" "$fetch_error" <<'PY'
+          if ! curl --fail --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --output "$relay_dir/previous.json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/status"; then
+            printf '{"statuses":[]}\n' > "$relay_dir/previous.json"
+          fi
+
+          python3 - \
+            "$relay_dir/status.json" \
+            "$relay_dir/previous.json" \
+            "$relay_dir/payload.json" \
+            "$fetch_error" <<'PY'
           import json
+          import re
           import sys
           from datetime import datetime, timezone
 
-          source_path, payload_path, fetch_error = sys.argv[1:]
+          source_path, previous_path, payload_path, fetch_error = sys.argv[1:]
           now = datetime.now(timezone.utc)
+          context = "estkme-red/oracle-monitor"
+          event_pattern = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+          price_pattern = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+
+          def parse_checked(value):
+              if not isinstance(value, str) or not value.endswith("Z"):
+                  raise ValueError("checked")
+              parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+              age = (now - parsed).total_seconds()
+              if age > 7200 or age < -300:
+                  raise ValueError("stale")
+              return value
+
+          def nonnegative_int(value, field):
+              if isinstance(value, bool):
+                  raise ValueError(field)
+              parsed = int(value)
+              if parsed < 0:
+                  raise ValueError(field)
+              return parsed
+
+          def previous_sequence():
+              try:
+                  with open(previous_path, encoding="utf-8") as handle:
+                      statuses = json.load(handle).get("statuses", [])
+                  targets = [item for item in statuses if item.get("context") == context]
+                  latest = max(targets, key=lambda item: item.get("created_at", ""))
+                  fields = latest.get("description", "").split("|")
+                  sequence_fields = [field for field in fields if field.startswith("seq=")]
+                  if len(sequence_fields) != 1:
+                      return 0
+                  return nonnegative_int(sequence_fields[0].split("=", 1)[1], "previous_seq")
+              except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                  return 0
+
+          def commit_status(state, description):
+              if len(description) > 140:
+                  raise ValueError("description_too_long")
+              return {"state": state, "context": context, "description": description}
 
           def fail(reason):
-              description = f"error|reason={reason}|relay={now.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-              return {"state": "error", "context": "estkme-red/oracle-monitor", "description": description[:140]}
+              checked = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+              description = (
+                  f"error|failures=1|reason={reason}|checked={checked}|"
+                  f"event=monitor_failure|seq={previous_sequence()}"
+              )
+              return commit_status("error", description)
 
           if fetch_error:
               payload = fail(fetch_error)
@@ -64,45 +123,41 @@ jobs:
                       status = json.load(handle)
                   if status.get("schema_version") != 1 or status.get("monitor") != "estkme-red":
                       raise ValueError("schema")
-                  checked_at = status["checked_at"]
-                  checked = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
-                  age = (now - checked).total_seconds()
-                  if age > 7200 or age < -300:
-                      raise ValueError("stale")
 
+                  checked_at = parse_checked(status["checked_at"])
+                  event = status.get("event")
+                  if not isinstance(event, str) or not event_pattern.fullmatch(event):
+                      raise ValueError("event")
+                  sequence = nonnegative_int(status.get("event_sequence"), "seq")
                   monitor_status = status.get("monitor_status")
-                  event = str(status.get("event", "none"))
-                  sequence = int(status.get("event_sequence", 0))
+
                   if monitor_status == "error":
-                      failures = int(status.get("consecutive_failures", 0))
+                      failures = nonnegative_int(status.get("consecutive_failures"), "failures")
+                      if failures < 1:
+                          raise ValueError("failures")
                       description = (
-                          f"error|failures={failures}|checked={checked_at}|"
+                          f"error|failures={failures}|reason=fetch_failed|checked={checked_at}|"
                           f"event={event}|seq={sequence}"
                       )
-                      payload = {
-                          "state": "error",
-                          "context": "estkme-red/oracle-monitor",
-                          "description": description[:140],
-                      }
+                      payload = commit_status("error", description)
                   elif monitor_status == "ok":
                       product = status["product"]
-                      if product.get("title") != "ESTKme Red":
+                      if not isinstance(product, dict) or product.get("title") != "ESTKme Red":
                           raise ValueError("product")
-                      stock = int(product["stock"])
-                      if stock < 0 or isinstance(product["stock"], bool):
-                          raise ValueError("stock")
-                      product_status = product["status"]
-                      presale = str(product["is_presale"]).lower()
-                      price = str(product["price"])
+                      stock = nonnegative_int(product.get("stock"), "stock")
+                      product_status = nonnegative_int(product.get("status"), "status")
+                      presale_value = product.get("is_presale")
+                      if not isinstance(presale_value, bool):
+                          raise ValueError("presale")
+                      presale = str(presale_value).lower()
+                      price = product.get("price")
+                      if not isinstance(price, str) or not price_pattern.fullmatch(price):
+                          raise ValueError("price")
                       description = (
                           f"ok|stock={stock}|status={product_status}|presale={presale}|"
                           f"price={price}|checked={checked_at}|event={event}|seq={sequence}"
                       )
-                      payload = {
-                          "state": "success",
-                          "context": "estkme-red/oracle-monitor",
-                          "description": description[:140],
-                      }
+                      payload = commit_status("success", description)
                   else:
                       raise ValueError("monitor_status")
               except (KeyError, TypeError, ValueError, json.JSONDecodeError):
