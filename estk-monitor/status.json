@@ -1,0 +1,11 @@
+{
+  "product": "ESTKme Red",
+  "source": "https://api.estk.me/user/shop/products/2",
+  "fetch_ok": false,
+  "stock": null,
+  "status": null,
+  "is_presale": null,
+  "price": null,
+  "checked_at": null,
+  "note": "relay initialized; waiting for first workflow run"
+}
