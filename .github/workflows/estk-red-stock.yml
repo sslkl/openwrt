@@ -1,8 +1,8 @@
-name: ESTKme Red Oracle status relay
+name: ESTK monitor state rotation
 
 on:
   schedule:
-    - cron: "11,26,41,56 * * * *"
+    - cron: "17 0 * * *"
   workflow_dispatch:
   push:
     branches:
@@ -15,55 +15,89 @@ permissions:
   statuses: write
 
 concurrency:
-  group: estk-red-oracle-status-relay
+  group: estk-monitor-state-rotation
   cancel-in-progress: false
 
 jobs:
-  relay:
+  rotate:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     env:
-      ORACLE_STATUS_URL: http://165.1.76.90/estk-monitor/status.json
       STATE_BRANCH: estk-monitor-state
       STATE_HEARTBEAT_PATH: .estk-monitor-heartbeat
       STATUS_CONTEXT: estkme-red/oracle-monitor
     steps:
-      - name: Fetch, validate, rotate state, and publish commit status
+      - name: Prepare next state commit, copy status, and fast-forward branch
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          relay_dir="$(mktemp -d)"
-          trap 'rm -rf "$relay_dir"' EXIT
+          work_dir="$(mktemp -d)"
+          trap 'rm -rf "$work_dir"' EXIT
 
           api_get() {
+            local output_path="$1"
+            local url="$2"
             curl --fail --silent --show-error \
               --connect-timeout 10 --max-time 30 \
               --retry 2 --retry-delay 2 --retry-all-errors \
+              --max-filesize 1048576 \
               --header "Authorization: Bearer $GH_TOKEN" \
               --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "$@"
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              --output "$output_path" \
+              "$url"
           }
 
-          fetch_error=""
-          if ! curl --fail --silent --show-error --location \
-            --connect-timeout 10 --max-time 30 \
-            --retry 2 --retry-delay 2 --retry-all-errors \
-            --max-filesize 65536 \
-            --output "$relay_dir/status.json" \
-            "$ORACLE_STATUS_URL"; then
-            fetch_error="relay_fetch_failed"
-            printf '{}\n' > "$relay_dir/status.json"
-          fi
+          api_write() {
+            local method="$1"
+            local output_path="$2"
+            local payload_path="$3"
+            local url="$4"
+            curl --fail-with-body --silent --show-error \
+              --request "$method" \
+              --connect-timeout 10 --max-time 30 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              --header "Content-Type: application/json" \
+              --data-binary "@$payload_path" \
+              --output "$output_path" \
+              "$url"
+          }
 
-          api_get \
-            --output "$relay_dir/state-branch.json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/branches/$STATE_BRANCH"
+          api_status_write() {
+            local output_path="$1"
+            local payload_path="$2"
+            local http_code_path="$3"
+            local url="$4"
+            local http_code
+            local curl_rc
+            http_code="$(curl --silent --show-error \
+              --request POST \
+              --connect-timeout 10 --max-time 30 \
+              --max-filesize 1048576 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              --header "Content-Type: application/json" \
+              --data-binary "@$payload_path" \
+              --output "$output_path" \
+              --write-out '%{http_code}' \
+              "$url")"
+            curl_rc=$?
+            printf '%s\n' "$http_code" >"$http_code_path"
+            return "$curl_rc"
+          }
 
-          state_sha="$(
-            python3 - "$relay_dir/state-branch.json" <<'PY'
+          api_root="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          api_get "$work_dir/branch.json" "$api_root/branches/$STATE_BRANCH"
+          api_get "$work_dir/heartbeat.json" \
+            "$api_root/contents/$STATE_HEARTBEAT_PATH?ref=$STATE_BRANCH"
+          api_get "$work_dir/combined.json" "$api_root/commits/$STATE_BRANCH/status"
+
+          old_sha="$(python3 - "$work_dir/branch.json" <<'PY'
           import json
           import re
           import sys
@@ -76,284 +110,448 @@ jobs:
           print(sha)
           PY
           )"
-
-          if ! api_get \
-            --output "$relay_dir/previous.json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/$state_sha/status"; then
-            printf '{"statuses":[]}\n' > "$relay_dir/previous.json"
-          fi
-
-          api_get \
-            --output "$relay_dir/heartbeat.json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/$STATE_HEARTBEAT_PATH?ref=$STATE_BRANCH"
-
-          rotate="$(
-            python3 - "$relay_dir/heartbeat.json" <<'PY'
-          import base64
-          import json
-          import re
-          import sys
-          from datetime import datetime, timezone
-
-          with open(sys.argv[1], encoding="utf-8") as handle:
-              data = json.load(handle)
-
-          blob_sha = data.get("sha")
-          encoded = data.get("content")
-          if not isinstance(blob_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
-              raise SystemExit("invalid heartbeat blob SHA")
-          if not isinstance(encoded, str):
-              raise SystemExit("invalid heartbeat content")
-
-          current = base64.b64decode(encoded).decode("utf-8").strip()
-          today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-          print("yes" if current != today else "no")
-          PY
-          )"
-
-          if [ "$rotate" = "yes" ]; then
-            python3 - "$relay_dir/heartbeat.json" "$relay_dir/rotate-payload.json" <<'PY'
-          import base64
-          import json
-          import re
-          import sys
-          from datetime import datetime, timezone
-
-          source_path, payload_path = sys.argv[1:]
-          with open(source_path, encoding="utf-8") as handle:
-              data = json.load(handle)
-
-          blob_sha = data.get("sha")
-          if not isinstance(blob_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
-              raise SystemExit("invalid heartbeat blob SHA")
-
-          today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-          payload = {
-              "message": f"Rotate ESTK monitor state {today}",
-              "content": base64.b64encode(f"{today}\n".encode()).decode(),
-              "sha": blob_sha,
-              "branch": "estk-monitor-state",
-          }
-          with open(payload_path, "w", encoding="utf-8") as handle:
-              json.dump(payload, handle, separators=(",", ":"))
-          PY
-
-            curl --fail-with-body --silent --show-error \
-              --request PUT \
-              --connect-timeout 10 --max-time 30 \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              --header "Content-Type: application/json" \
-              --data-binary "@$relay_dir/rotate-payload.json" \
-              --output "$relay_dir/rotate-response.json" \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/$STATE_HEARTBEAT_PATH"
-
-            state_sha="$(
-              python3 - "$relay_dir/rotate-response.json" <<'PY'
-          import json
-          import re
-          import sys
-
-          with open(sys.argv[1], encoding="utf-8") as handle:
-              data = json.load(handle)
-          sha = data.get("commit", {}).get("sha")
-          if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
-              raise SystemExit("invalid rotated state SHA")
-          print(sha)
-          PY
-            )"
-          fi
+          api_get "$work_dir/git-commit.json" "$api_root/git/commits/$old_sha"
 
           python3 - \
-            "$relay_dir/status.json" \
-            "$relay_dir/previous.json" \
-            "$relay_dir/payload.json" \
-            "$fetch_error" <<'PY'
+            "$work_dir/branch.json" \
+            "$work_dir/heartbeat.json" \
+            "$work_dir/combined.json" \
+            "$work_dir/git-commit.json" \
+            "$work_dir/meta.json" \
+            "$work_dir/blob-payload.json" \
+            "$work_dir/status-payload.json" <<'PY'
+          import base64
           import json
           import re
           import sys
           from datetime import datetime, timezone
 
-          source_path, previous_path, payload_path, fetch_error = sys.argv[1:]
-          now = datetime.now(timezone.utc)
-          context = "estkme-red/oracle-monitor"
-
-          event_pattern = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+          (
+              branch_path,
+              heartbeat_path,
+              combined_path,
+              commit_path,
+              meta_path,
+              blob_payload_path,
+              status_payload_path,
+          ) = sys.argv[1:]
+          sha_pattern = re.compile(r"^[0-9a-f]{40}$")
           uint_pattern = re.compile(r"^(?:0|[1-9][0-9]{0,9})$")
           price_pattern = re.compile(r"^(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,4})?$")
-          allowed_error_reasons = {
-              "relay_fetch_failed",
-              "invalid_or_stale_status",
-              "source_fetch_failed",
+          allowed_events = {
+              "none",
+              "initialized",
+              "restocked",
+              "sold_out",
+              "monitor_failure",
+              "monitor_recovered",
           }
+          allowed_reasons = {"invalid_or_stale_status", "source_fetch_failed"}
 
-          def parse_checked(value):
-              if not isinstance(value, str):
-                  raise ValueError("checked")
-              parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-              age = (now - parsed).total_seconds()
-              if age > 7200 or age < -300:
-                  raise ValueError("stale")
+          def load(path):
+              with open(path, encoding="utf-8") as handle:
+                  return json.load(handle)
+
+          def strict_sha(value, field):
+              if not isinstance(value, str) or not sha_pattern.fullmatch(value):
+                  raise SystemExit(f"invalid {field}")
               return value
 
-          def strict_uint(value, field):
-              if isinstance(value, bool) or not isinstance(value, int):
-                  raise ValueError(field)
-              if value < 0 or value > 9_999_999_999:
-                  raise ValueError(field)
-              return value
+          def token_value(token, prefix):
+              marker = f"{prefix}="
+              if not isinstance(token, str) or not token.startswith(marker):
+                  raise ValueError(prefix)
+              return token[len(marker):]
 
-          def parse_uint_token(value, field):
-              if not isinstance(value, str) or not uint_pattern.fullmatch(value):
+          def parse_uint(value, field):
+              if not uint_pattern.fullmatch(value):
                   raise ValueError(field)
               return int(value)
 
-          def previous_error_state():
+          def parse_time(value, freshness=False):
+              if not isinstance(value, str) or not re.fullmatch(
+                  r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value
+              ):
+                  raise ValueError("time")
+              parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+              if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+                  raise ValueError("time")
+              if freshness:
+                  age = (datetime.now(timezone.utc) - parsed).total_seconds()
+                  if age > 7200 or age < -300:
+                      raise ValueError("stale")
+              return parsed
+
+          branch = load(branch_path)
+          old_sha = strict_sha(branch.get("commit", {}).get("sha"), "branch SHA")
+
+          heartbeat = load(heartbeat_path)
+          encoded = heartbeat.get("content")
+          if not isinstance(encoded, str):
+              raise SystemExit("invalid heartbeat content")
+          try:
+              heartbeat_text = base64.b64decode(encoded, validate=True).decode("ascii")
+              if not re.fullmatch(r"\d{4}-\d{2}-\d{2}\n", heartbeat_text):
+                  raise ValueError("heartbeat format")
+              current_day = datetime.strptime(heartbeat_text, "%Y-%m-%d\n").date()
+          except (UnicodeDecodeError, ValueError) as exc:
+              raise SystemExit("invalid heartbeat value") from exc
+
+          today = datetime.now(timezone.utc).date()
+          if current_day > today:
+              raise SystemExit("heartbeat is in the future")
+
+          git_commit = load(commit_path)
+          if strict_sha(git_commit.get("sha"), "git commit SHA") != old_sha:
+              raise SystemExit("state branch changed during preparation")
+          old_tree_sha = strict_sha(git_commit.get("tree", {}).get("sha"), "tree SHA")
+
+          combined = load(combined_path)
+          if strict_sha(combined.get("sha"), "combined status SHA") != old_sha:
+              raise SystemExit("combined status does not match state branch")
+          statuses = combined.get("statuses")
+          if not isinstance(statuses, list):
+              raise SystemExit("invalid status list")
+
+          candidates = []
+          for item in statuses:
+              if not isinstance(item, dict) or item.get("context") != "estkme-red/oracle-monitor":
+                  continue
               try:
-                  with open(previous_path, encoding="utf-8") as handle:
-                      statuses = json.load(handle).get("statuses", [])
-                  targets = [item for item in statuses if item.get("context") == context]
-                  if not targets:
-                      return 0, 0
-                  latest = max(targets, key=lambda item: item.get("created_at", ""))
-                  description = latest.get("description")
-                  if not isinstance(description, str):
-                      return 0, 0
-                  tokens = description.split("|")
+                  created_at = parse_time(item.get("created_at"))
+              except (TypeError, ValueError) as exc:
+                  raise SystemExit("ESTK status has an invalid creation time") from exc
+              status_id = item.get("id")
+              if isinstance(status_id, bool) or not isinstance(status_id, int) or status_id <= 0:
+                  raise SystemExit("ESTK status has an invalid ID")
+              candidates.append((created_at, status_id, item))
+          if not candidates:
+              raise SystemExit("missing ESTK status on current state SHA")
+          latest = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
 
-                  if latest.get("state") == "success":
-                      if len(tokens) != 8 or tokens[0] != "ok":
-                          return 0, 0
-                      fields = dict(token.split("=", 1) for token in tokens[1:])
-                      if set(fields) != {"stock", "status", "presale", "price", "checked", "event", "seq"}:
-                          return 0, 0
-                      return 0, parse_uint_token(fields["seq"], "previous_seq")
-
-                  if latest.get("state") == "error":
-                      if len(tokens) != 6 or tokens[0] != "error":
-                          return 0, 0
-                      fields = dict(token.split("=", 1) for token in tokens[1:])
-                      if set(fields) != {"failures", "reason", "checked", "event", "seq"}:
-                          return 0, 0
-                      failures = parse_uint_token(fields["failures"], "previous_failures")
-                      sequence = parse_uint_token(fields["seq"], "previous_seq")
-                      return failures, sequence
-              except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-                  pass
-              return 0, 0
-
-          previous_failures, previous_sequence = previous_error_state()
-
-          def commit_status(state, description):
-              if len(description) > 140:
-                  raise ValueError("description_too_long")
-              return {"state": state, "context": context, "description": description}
-
-          def fail(reason):
-              if reason not in allowed_error_reasons:
-                  reason = "invalid_or_stale_status"
-              checked = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-              failures = min(previous_failures + 1, 9_999_999_999)
-              description = (
-                  f"error|failures={failures}|reason={reason}|checked={checked}|"
-                  f"event=monitor_failure|seq={previous_sequence}"
-              )
-              return commit_status("error", description)
-
-          if fetch_error:
-              payload = fail(fetch_error)
-          else:
-              try:
-                  with open(source_path, encoding="utf-8") as handle:
-                      status = json.load(handle)
-
-                  schema_version = status.get("schema_version")
-                  if isinstance(schema_version, bool) or schema_version != 1:
-                      raise ValueError("schema")
-                  if status.get("monitor") != "estkme-red":
-                      raise ValueError("monitor")
-
-                  checked_at = parse_checked(status.get("checked_at"))
-                  event = status.get("event")
-                  if not isinstance(event, str) or not event_pattern.fullmatch(event):
+          try:
+              description = latest.get("description")
+              if not isinstance(description, str) or len(description) > 140:
+                  raise ValueError("description")
+              tokens = description.split("|")
+              if latest.get("state") == "success":
+                  if len(tokens) != 8 or tokens[0] != "ok":
+                      raise ValueError("success fields")
+                  stock = parse_uint(token_value(tokens[1], "stock"), "stock")
+                  parse_uint(token_value(tokens[2], "status"), "status")
+                  if token_value(tokens[3], "presale") not in {"true", "false"}:
+                      raise ValueError("presale")
+                  if not price_pattern.fullmatch(token_value(tokens[4], "price")):
+                      raise ValueError("price")
+                  parse_time(token_value(tokens[5], "checked"), freshness=True)
+                  event = token_value(tokens[6], "event")
+                  if event not in allowed_events or event == "monitor_failure":
                       raise ValueError("event")
-                  sequence = strict_uint(status.get("event_sequence"), "seq")
-                  monitor_status = status.get("monitor_status")
+                  sequence = parse_uint(token_value(tokens[7], "seq"), "seq")
+                  if event == "restocked" and stock == 0:
+                      raise ValueError("restocked stock")
+                  if event == "sold_out" and stock > 0:
+                      raise ValueError("sold_out stock")
+                  if event == "initialized" and sequence != 0:
+                      raise ValueError("initialized seq")
+              elif latest.get("state") == "error":
+                  if len(tokens) != 6 or tokens[0] != "error":
+                      raise ValueError("error fields")
+                  failures = parse_uint(token_value(tokens[1], "failures"), "failures")
+                  if failures < 1:
+                      raise ValueError("failures")
+                  if token_value(tokens[2], "reason") not in allowed_reasons:
+                      raise ValueError("reason")
+                  parse_time(token_value(tokens[3], "checked"), freshness=True)
+                  event = token_value(tokens[4], "event")
+                  expected_event = "monitor_failure" if failures == 3 else "none"
+                  if event != expected_event:
+                      raise ValueError("event")
+                  parse_uint(token_value(tokens[5], "seq"), "seq")
+              else:
+                  raise ValueError("state")
+          except (TypeError, ValueError) as exc:
+              raise SystemExit("current ESTK status is invalid or stale") from exc
 
-                  if monitor_status == "error":
-                      failures = strict_uint(status.get("consecutive_failures"), "failures")
-                      if failures < 1:
-                          raise ValueError("failures")
-                      description = (
-                          f"error|failures={failures}|reason=source_fetch_failed|checked={checked_at}|"
-                          f"event={event}|seq={sequence}"
-                      )
-                      payload = commit_status("error", description)
+          if current_day == today:
+              with open(meta_path, "w", encoding="utf-8") as handle:
+                  json.dump({"rotate": False}, handle, separators=(",", ":"))
+              raise SystemExit(0)
 
-                  elif monitor_status == "ok":
-                      product = status.get("product")
-                      if not isinstance(product, dict) or product.get("title") != "ESTKme Red":
-                          raise ValueError("product")
+          status_payload = {
+              "state": latest["state"],
+              "context": "estkme-red/oracle-monitor",
+              "description": description,
+          }
+          blob_payload = {"content": f"{today.isoformat()}\n", "encoding": "utf-8"}
+          meta = {
+              "rotate": True,
+              "old_sha": old_sha,
+              "old_tree_sha": old_tree_sha,
+              "today": today.isoformat(),
+          }
+          for path, payload in (
+              (meta_path, meta),
+              (blob_payload_path, blob_payload),
+              (status_payload_path, status_payload),
+          ):
+              with open(path, "w", encoding="utf-8") as handle:
+                  json.dump(payload, handle, separators=(",", ":"))
+          PY
 
-                      stock = strict_uint(product.get("stock"), "stock")
-                      product_status = strict_uint(product.get("status"), "status")
+          rotate="$(python3 - "$work_dir/meta.json" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              print("yes" if json.load(handle).get("rotate") is True else "no")
+          PY
+          )"
+          if [ "$rotate" != "yes" ]; then
+            echo "ESTK monitor state already rotated for the current UTC day"
+            exit 0
+          fi
 
-                      presale_value = product.get("is_presale")
-                      if not isinstance(presale_value, bool):
-                          raise ValueError("presale")
-                      presale = str(presale_value).lower()
-
-                      price = product.get("price")
-                      if not isinstance(price, str) or not price_pattern.fullmatch(price):
-                          raise ValueError("price")
-
-                      description = (
-                          f"ok|stock={stock}|status={product_status}|presale={presale}|"
-                          f"price={price}|checked={checked_at}|event={event}|seq={sequence}"
-                      )
-                      payload = commit_status("success", description)
-
-                  else:
-                      raise ValueError("monitor_status")
-
-              except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                  payload = fail("invalid_or_stale_status")
-
-          with open(payload_path, "w", encoding="utf-8") as handle:
+          api_write POST "$work_dir/blob-response.json" "$work_dir/blob-payload.json" \
+            "$api_root/git/blobs"
+          python3 - "$work_dir/meta.json" "$work_dir/blob-response.json" "$work_dir/tree-payload.json" <<'PY'
+          import json
+          import re
+          import sys
+          meta_path, response_path, output_path = sys.argv[1:]
+          with open(meta_path, encoding="utf-8") as handle:
+              meta = json.load(handle)
+          with open(response_path, encoding="utf-8") as handle:
+              response = json.load(handle)
+          blob_sha = response.get("sha")
+          if not isinstance(blob_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
+              raise SystemExit("invalid blob response")
+          payload = {
+              "base_tree": meta["old_tree_sha"],
+              "tree": [{
+                  "path": ".estk-monitor-heartbeat",
+                  "mode": "100644",
+                  "type": "blob",
+                  "sha": blob_sha,
+              }],
+          }
+          with open(output_path, "w", encoding="utf-8") as handle:
               json.dump(payload, handle, separators=(",", ":"))
           PY
 
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --connect-timeout 10 --max-time 30 \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            --header "Content-Type: application/json" \
-            --data-binary "@$relay_dir/payload.json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/statuses/$state_sha" \
-            >/dev/null
+          api_write POST "$work_dir/tree-response.json" "$work_dir/tree-payload.json" \
+            "$api_root/git/trees"
+          python3 - "$work_dir/meta.json" "$work_dir/tree-response.json" "$work_dir/commit-payload.json" <<'PY'
+          import json
+          import re
+          import sys
+          meta_path, response_path, output_path = sys.argv[1:]
+          with open(meta_path, encoding="utf-8") as handle:
+              meta = json.load(handle)
+          with open(response_path, encoding="utf-8") as handle:
+              response = json.load(handle)
+          tree_sha = response.get("sha")
+          if not isinstance(tree_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", tree_sha):
+              raise SystemExit("invalid tree response")
+          payload = {
+              "message": f"Rotate ESTK monitor state {meta['today']}",
+              "tree": tree_sha,
+              "parents": [meta["old_sha"]],
+          }
+          with open(output_path, "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, separators=(",", ":"))
+          PY
 
-          api_get \
-            --output "$relay_dir/verify.json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/$state_sha/status"
+          api_write POST "$work_dir/commit-response.json" "$work_dir/commit-payload.json" \
+            "$api_root/git/commits"
+          new_sha="$(python3 - "$work_dir/commit-response.json" <<'PY'
+          import json
+          import re
+          import sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              sha = json.load(handle).get("sha")
+          if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise SystemExit("invalid commit response")
+          print(sha)
+          PY
+          )"
 
-          python3 - "$relay_dir/payload.json" "$relay_dir/verify.json" <<'PY'
+          set +e
+          api_status_write "$work_dir/status-response.json" "$work_dir/status-payload.json" \
+            "$work_dir/status-http-code.txt" "$api_root/statuses/$new_sha"
+          status_post_rc=$?
+          set -e
+          api_get "$work_dir/new-combined.json" "$api_root/commits/$new_sha/status"
+          python3 - "$work_dir/status-payload.json" "$work_dir/status-response.json" \
+            "$work_dir/status-http-code.txt" "$work_dir/new-combined.json" \
+            "$status_post_rc" "$new_sha" <<'PY'
+          from datetime import datetime, timezone
+          import json
+          import re
+          import sys
+          (
+              payload_path,
+              response_path,
+              http_code_path,
+              combined_path,
+              post_rc_text,
+              new_sha,
+          ) = sys.argv[1:]
+          with open(payload_path, encoding="utf-8") as handle:
+              expected = json.load(handle)
+          with open(combined_path, encoding="utf-8") as handle:
+              combined = json.load(handle)
+
+          try:
+              post_rc = int(post_rc_text)
+          except ValueError as exc:
+              raise SystemExit("invalid create-status exit code") from exc
+          try:
+              with open(http_code_path, encoding="ascii") as handle:
+                  http_code = int(handle.read().strip())
+          except (OSError, ValueError) as exc:
+              raise SystemExit("invalid create-status HTTP code") from exc
+          transient_curl_exit_codes = {5, 6, 7, 18, 28, 35, 52, 55, 56}
+          if post_rc != 0 and post_rc not in transient_curl_exit_codes:
+              raise SystemExit(f"create-status failed permanently; post_rc={post_rc}")
+          http_success = 200 <= http_code < 300
+          http_ambiguous = http_code == 429 or 500 <= http_code < 600
+          if post_rc == 0 and not http_success and not http_ambiguous:
+              raise SystemExit(f"create-status failed permanently; http_code={http_code}")
+          if combined.get("sha") != new_sha:
+              raise SystemExit("new combined status SHA mismatch")
+
+          statuses = combined.get("statuses")
+          if not isinstance(statuses, list):
+              raise SystemExit("new status list is invalid")
+          candidates = []
+          for item in statuses:
+              if not isinstance(item, dict) or item.get("context") != expected["context"]:
+                  continue
+              created_at = item.get("created_at")
+              if not isinstance(created_at, str) or not re.fullmatch(
+                  r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", created_at
+              ):
+                  raise SystemExit("new status creation time is invalid")
+              try:
+                  parsed = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+                      tzinfo=timezone.utc
+                  )
+              except ValueError as exc:
+                  raise SystemExit("new status creation time is invalid") from exc
+              status_id = item.get("id")
+              if isinstance(status_id, bool) or not isinstance(status_id, int) or status_id <= 0:
+                  raise SystemExit("new state status ID is invalid")
+              candidates.append((parsed, status_id, item))
+          if not candidates:
+              raise SystemExit(f"new state status verification failed; post_rc={post_rc}")
+          latest = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
+          if latest.get("state") != expected["state"] or latest.get("description") != expected["description"]:
+              raise SystemExit(
+                  f"new state status verification failed; post_rc={post_rc}; http_code={http_code}"
+              )
+
+          latest_id = latest.get("id")
+          if isinstance(latest_id, bool) or not isinstance(latest_id, int) or latest_id <= 0:
+              raise SystemExit("new state status ID is invalid")
+
+          if post_rc == 0 and http_success:
+              with open(response_path, encoding="utf-8") as handle:
+                  response = json.load(handle)
+              status_id = response.get("id")
+              if isinstance(status_id, bool) or not isinstance(status_id, int) or status_id <= 0:
+                  raise SystemExit("invalid create-status response")
+              if latest_id != status_id:
+                  raise SystemExit("created status ID is missing from readback")
+          PY
+
+          python3 - "$new_sha" "$work_dir/ref-payload.json" <<'PY'
           import json
           import sys
-
-          with open(sys.argv[1], encoding="utf-8") as handle:
-              expected = json.load(handle)
-          with open(sys.argv[2], encoding="utf-8") as handle:
-              statuses = json.load(handle).get("statuses", [])
-
-          matches = [
-              item for item in statuses
-              if item.get("context") == expected["context"]
-              and item.get("state") == expected["state"]
-              and item.get("description") == expected["description"]
-          ]
-          if not matches:
-              raise SystemExit("published ESTK status verification failed")
+          with open(sys.argv[2], "w", encoding="utf-8") as handle:
+              json.dump({"sha": sys.argv[1], "force": False}, handle, separators=(",", ":"))
           PY
+          set +e
+          api_write PATCH "$work_dir/ref-response.json" "$work_dir/ref-payload.json" \
+            "$api_root/git/refs/heads/$STATE_BRANCH"
+          ref_update_rc=$?
+          set -e
+
+          api_get "$work_dir/final-branch.json" "$api_root/branches/$STATE_BRANCH"
+          api_get "$work_dir/final-heartbeat.json" \
+            "$api_root/contents/$STATE_HEARTBEAT_PATH?ref=$STATE_BRANCH"
+          api_get "$work_dir/final-combined.json" "$api_root/commits/$STATE_BRANCH/status"
+          python3 - "$new_sha" "$work_dir/meta.json" "$work_dir/final-branch.json" \
+            "$work_dir/final-heartbeat.json" "$work_dir/status-payload.json" \
+            "$work_dir/final-combined.json" "$ref_update_rc" <<'PY'
+          import base64
+          from datetime import datetime
+          import json
+          import re
+          import sys
+          (
+              new_sha,
+              meta_path,
+              branch_path,
+              heartbeat_path,
+              status_payload_path,
+              combined_path,
+              update_rc,
+          ) = sys.argv[1:]
+          with open(meta_path, encoding="utf-8") as handle:
+              meta = json.load(handle)
+          with open(branch_path, encoding="utf-8") as handle:
+              branch = json.load(handle)
+          with open(heartbeat_path, encoding="utf-8") as handle:
+              heartbeat = json.load(handle)
+          with open(status_payload_path, encoding="utf-8") as handle:
+              expected_status = json.load(handle)
+          with open(combined_path, encoding="utf-8") as handle:
+              combined = json.load(handle)
+
+          if branch.get("commit", {}).get("sha") != new_sha:
+              raise SystemExit(f"state branch update verification failed; patch_rc={update_rc}")
+          encoded = heartbeat.get("content")
+          if not isinstance(encoded, str):
+              raise SystemExit("final heartbeat content missing")
+          try:
+              value = base64.b64decode(encoded, validate=True).decode("ascii")
+          except (UnicodeDecodeError, ValueError) as exc:
+              raise SystemExit("final heartbeat is invalid") from exc
+          if value != f"{meta['today']}\n":
+              raise SystemExit("final heartbeat date mismatch")
+          if combined.get("sha") != new_sha:
+              raise SystemExit("final combined status SHA mismatch")
+          statuses = combined.get("statuses")
+          if not isinstance(statuses, list):
+              raise SystemExit("final status list is invalid")
+          candidates = []
+          for item in statuses:
+              if not isinstance(item, dict) or item.get("context") != expected_status["context"]:
+                  continue
+              created_at = item.get("created_at")
+              if not isinstance(created_at, str) or not re.fullmatch(
+                  r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", created_at
+              ):
+                  raise SystemExit("final status creation time is invalid")
+              try:
+                  parsed = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
+              except ValueError as exc:
+                  raise SystemExit("final status creation time is invalid") from exc
+              status_id = item.get("id")
+              if isinstance(status_id, bool) or not isinstance(status_id, int) or status_id <= 0:
+                  raise SystemExit("final status ID is invalid")
+              candidates.append((parsed, status_id, item))
+          if not candidates:
+              raise SystemExit("final status is missing")
+          latest = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
+          if (
+              latest.get("state") != expected_status["state"]
+              or latest.get("description") != expected_status["description"]
+          ):
+              raise SystemExit("final status does not match the copied status")
+          latest_id = latest.get("id")
+          if isinstance(latest_id, bool) or not isinstance(latest_id, int) or latest_id <= 0:
+              raise SystemExit("final status ID is invalid")
+          PY
+
+          echo "ESTK monitor state rotation verified: ${new_sha:0:12}"
