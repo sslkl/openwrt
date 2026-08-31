@@ -2,7 +2,7 @@ name: ESTKme Red Oracle status relay
 
 on:
   schedule:
-    - cron: "7,37 * * * *"
+    - cron: "11,26,41,56 * * * *"
   workflow_dispatch:
   push:
     branches:
@@ -11,7 +11,7 @@ on:
       - .github/workflows/estk-red-stock.yml
 
 permissions:
-  contents: read
+  contents: write
   statuses: write
 
 concurrency:
@@ -24,35 +24,145 @@ jobs:
     timeout-minutes: 4
     env:
       ORACLE_STATUS_URL: http://165.1.76.90/estk-monitor/status.json
+      STATE_BRANCH: estk-monitor-state
+      STATE_HEARTBEAT_PATH: .estk-monitor-heartbeat
       STATUS_CONTEXT: estkme-red/oracle-monitor
     steps:
-      - name: Fetch, validate, and publish commit status
+      - name: Fetch, validate, rotate state, and publish commit status
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           relay_dir="$(mktemp -d)"
-          fetch_error=""
+          trap 'rm -rf "$relay_dir"' EXIT
 
+          api_get() {
+            curl --fail --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              --retry 2 --retry-delay 2 --retry-all-errors \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$@"
+          }
+
+          fetch_error=""
           if ! curl --fail --silent --show-error --location \
             --connect-timeout 10 --max-time 30 \
             --retry 2 --retry-delay 2 --retry-all-errors \
             --max-filesize 65536 \
             --output "$relay_dir/status.json" \
             "$ORACLE_STATUS_URL"; then
-            fetch_error="fetch_failed"
+            fetch_error="relay_fetch_failed"
             printf '{}\n' > "$relay_dir/status.json"
           fi
 
-          if ! curl --fail --silent --show-error \
-            --connect-timeout 10 --max-time 30 \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
+          api_get \
+            --output "$relay_dir/state-branch.json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/branches/$STATE_BRANCH"
+
+          state_sha="$(
+            python3 - "$relay_dir/state-branch.json" <<'PY'
+          import json
+          import re
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              data = json.load(handle)
+          sha = data.get("commit", {}).get("sha")
+          if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise SystemExit("invalid state branch SHA")
+          print(sha)
+          PY
+          )"
+
+          if ! api_get \
             --output "$relay_dir/previous.json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/status"; then
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/$state_sha/status"; then
             printf '{"statuses":[]}\n' > "$relay_dir/previous.json"
+          fi
+
+          api_get \
+            --output "$relay_dir/heartbeat.json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/$STATE_HEARTBEAT_PATH?ref=$STATE_BRANCH"
+
+          rotate="$(
+            python3 - "$relay_dir/heartbeat.json" <<'PY'
+          import base64
+          import json
+          import re
+          import sys
+          from datetime import datetime, timezone
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              data = json.load(handle)
+
+          blob_sha = data.get("sha")
+          encoded = data.get("content")
+          if not isinstance(blob_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
+              raise SystemExit("invalid heartbeat blob SHA")
+          if not isinstance(encoded, str):
+              raise SystemExit("invalid heartbeat content")
+
+          current = base64.b64decode(encoded).decode("utf-8").strip()
+          today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+          print("yes" if current != today else "no")
+          PY
+          )"
+
+          if [ "$rotate" = "yes" ]; then
+            python3 - "$relay_dir/heartbeat.json" "$relay_dir/rotate-payload.json" <<'PY'
+          import base64
+          import json
+          import re
+          import sys
+          from datetime import datetime, timezone
+
+          source_path, payload_path = sys.argv[1:]
+          with open(source_path, encoding="utf-8") as handle:
+              data = json.load(handle)
+
+          blob_sha = data.get("sha")
+          if not isinstance(blob_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
+              raise SystemExit("invalid heartbeat blob SHA")
+
+          today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+          payload = {
+              "message": f"Rotate ESTK monitor state {today}",
+              "content": base64.b64encode(f"{today}\n".encode()).decode(),
+              "sha": blob_sha,
+              "branch": "estk-monitor-state",
+          }
+          with open(payload_path, "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, separators=(",", ":"))
+          PY
+
+            curl --fail-with-body --silent --show-error \
+              --request PUT \
+              --connect-timeout 10 --max-time 30 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --header "Content-Type: application/json" \
+              --data-binary "@$relay_dir/rotate-payload.json" \
+              --output "$relay_dir/rotate-response.json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/$STATE_HEARTBEAT_PATH"
+
+            state_sha="$(
+              python3 - "$relay_dir/rotate-response.json" <<'PY'
+          import json
+          import re
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              data = json.load(handle)
+          sha = data.get("commit", {}).get("sha")
+          if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise SystemExit("invalid rotated state SHA")
+          print(sha)
+          PY
+            )"
           fi
 
           python3 - \
@@ -68,11 +178,18 @@ jobs:
           source_path, previous_path, payload_path, fetch_error = sys.argv[1:]
           now = datetime.now(timezone.utc)
           context = "estkme-red/oracle-monitor"
+
           event_pattern = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
-          price_pattern = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+          uint_pattern = re.compile(r"^(?:0|[1-9][0-9]{0,9})$")
+          price_pattern = re.compile(r"^(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,4})?$")
+          allowed_error_reasons = {
+              "relay_fetch_failed",
+              "invalid_or_stale_status",
+              "source_fetch_failed",
+          }
 
           def parse_checked(value):
-              if not isinstance(value, str) or not value.endswith("Z"):
+              if not isinstance(value, str):
                   raise ValueError("checked")
               parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
               age = (now - parsed).total_seconds()
@@ -80,27 +197,53 @@ jobs:
                   raise ValueError("stale")
               return value
 
-          def nonnegative_int(value, field):
-              if isinstance(value, bool):
+          def strict_uint(value, field):
+              if isinstance(value, bool) or not isinstance(value, int):
                   raise ValueError(field)
-              parsed = int(value)
-              if parsed < 0:
+              if value < 0 or value > 9_999_999_999:
                   raise ValueError(field)
-              return parsed
+              return value
 
-          def previous_sequence():
+          def parse_uint_token(value, field):
+              if not isinstance(value, str) or not uint_pattern.fullmatch(value):
+                  raise ValueError(field)
+              return int(value)
+
+          def previous_error_state():
               try:
                   with open(previous_path, encoding="utf-8") as handle:
                       statuses = json.load(handle).get("statuses", [])
                   targets = [item for item in statuses if item.get("context") == context]
+                  if not targets:
+                      return 0, 0
                   latest = max(targets, key=lambda item: item.get("created_at", ""))
-                  fields = latest.get("description", "").split("|")
-                  sequence_fields = [field for field in fields if field.startswith("seq=")]
-                  if len(sequence_fields) != 1:
-                      return 0
-                  return nonnegative_int(sequence_fields[0].split("=", 1)[1], "previous_seq")
+                  description = latest.get("description")
+                  if not isinstance(description, str):
+                      return 0, 0
+                  tokens = description.split("|")
+
+                  if latest.get("state") == "success":
+                      if len(tokens) != 8 or tokens[0] != "ok":
+                          return 0, 0
+                      fields = dict(token.split("=", 1) for token in tokens[1:])
+                      if set(fields) != {"stock", "status", "presale", "price", "checked", "event", "seq"}:
+                          return 0, 0
+                      return 0, parse_uint_token(fields["seq"], "previous_seq")
+
+                  if latest.get("state") == "error":
+                      if len(tokens) != 6 or tokens[0] != "error":
+                          return 0, 0
+                      fields = dict(token.split("=", 1) for token in tokens[1:])
+                      if set(fields) != {"failures", "reason", "checked", "event", "seq"}:
+                          return 0, 0
+                      failures = parse_uint_token(fields["failures"], "previous_failures")
+                      sequence = parse_uint_token(fields["seq"], "previous_seq")
+                      return failures, sequence
               except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-                  return 0
+                  pass
+              return 0, 0
+
+          previous_failures, previous_sequence = previous_error_state()
 
           def commit_status(state, description):
               if len(description) > 140:
@@ -108,10 +251,13 @@ jobs:
               return {"state": state, "context": context, "description": description}
 
           def fail(reason):
+              if reason not in allowed_error_reasons:
+                  reason = "invalid_or_stale_status"
               checked = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+              failures = min(previous_failures + 1, 9_999_999_999)
               description = (
-                  f"error|failures=1|reason={reason}|checked={checked}|"
-                  f"event=monitor_failure|seq={previous_sequence()}"
+                  f"error|failures={failures}|reason={reason}|checked={checked}|"
+                  f"event=monitor_failure|seq={previous_sequence}"
               )
               return commit_status("error", description)
 
@@ -121,45 +267,56 @@ jobs:
               try:
                   with open(source_path, encoding="utf-8") as handle:
                       status = json.load(handle)
-                  if status.get("schema_version") != 1 or status.get("monitor") != "estkme-red":
-                      raise ValueError("schema")
 
-                  checked_at = parse_checked(status["checked_at"])
+                  schema_version = status.get("schema_version")
+                  if isinstance(schema_version, bool) or schema_version != 1:
+                      raise ValueError("schema")
+                  if status.get("monitor") != "estkme-red":
+                      raise ValueError("monitor")
+
+                  checked_at = parse_checked(status.get("checked_at"))
                   event = status.get("event")
                   if not isinstance(event, str) or not event_pattern.fullmatch(event):
                       raise ValueError("event")
-                  sequence = nonnegative_int(status.get("event_sequence"), "seq")
+                  sequence = strict_uint(status.get("event_sequence"), "seq")
                   monitor_status = status.get("monitor_status")
 
                   if monitor_status == "error":
-                      failures = nonnegative_int(status.get("consecutive_failures"), "failures")
+                      failures = strict_uint(status.get("consecutive_failures"), "failures")
                       if failures < 1:
                           raise ValueError("failures")
                       description = (
-                          f"error|failures={failures}|reason=fetch_failed|checked={checked_at}|"
+                          f"error|failures={failures}|reason=source_fetch_failed|checked={checked_at}|"
                           f"event={event}|seq={sequence}"
                       )
                       payload = commit_status("error", description)
+
                   elif monitor_status == "ok":
-                      product = status["product"]
+                      product = status.get("product")
                       if not isinstance(product, dict) or product.get("title") != "ESTKme Red":
                           raise ValueError("product")
-                      stock = nonnegative_int(product.get("stock"), "stock")
-                      product_status = nonnegative_int(product.get("status"), "status")
+
+                      stock = strict_uint(product.get("stock"), "stock")
+                      product_status = strict_uint(product.get("status"), "status")
+
                       presale_value = product.get("is_presale")
                       if not isinstance(presale_value, bool):
                           raise ValueError("presale")
                       presale = str(presale_value).lower()
+
                       price = product.get("price")
                       if not isinstance(price, str) or not price_pattern.fullmatch(price):
                           raise ValueError("price")
+
                       description = (
                           f"ok|stock={stock}|status={product_status}|presale={presale}|"
                           f"price={price}|checked={checked_at}|event={event}|seq={sequence}"
                       )
                       payload = commit_status("success", description)
+
                   else:
                       raise ValueError("monitor_status")
+
               except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                   payload = fail("invalid_or_stale_status")
 
@@ -169,10 +326,34 @@ jobs:
 
           curl --fail-with-body --silent --show-error \
             --request POST \
+            --connect-timeout 10 --max-time 30 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             --header "Content-Type: application/json" \
             --data-binary "@$relay_dir/payload.json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/statuses/$state_sha" \
             >/dev/null
+
+          api_get \
+            --output "$relay_dir/verify.json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/$state_sha/status"
+
+          python3 - "$relay_dir/payload.json" "$relay_dir/verify.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              expected = json.load(handle)
+          with open(sys.argv[2], encoding="utf-8") as handle:
+              statuses = json.load(handle).get("statuses", [])
+
+          matches = [
+              item for item in statuses
+              if item.get("context") == expected["context"]
+              and item.get("state") == expected["state"]
+              and item.get("description") == expected["description"]
+          ]
+          if not matches:
+              raise SystemExit("published ESTK status verification failed")
+          PY
