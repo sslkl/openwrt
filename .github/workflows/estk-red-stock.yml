@@ -121,6 +121,7 @@ jobs:
             "$work_dir/blob-payload.json" \
             "$work_dir/status-payload.json" <<'PY'
           import base64
+          import binascii
           import json
           import re
           import sys
@@ -187,14 +188,22 @@ jobs:
 
           heartbeat = load(heartbeat_path)
           encoded = heartbeat.get("content")
-          if not isinstance(encoded, str):
+          if (
+              not isinstance(encoded, str)
+              or not encoded
+              or not re.fullmatch(r"[A-Za-z0-9+/=\r\n]+", encoded)
+          ):
               raise SystemExit("invalid heartbeat content")
           try:
-              heartbeat_text = base64.b64decode(encoded, validate=True).decode("ascii")
+              compact = encoded.replace("\r", "").replace("\n", "")
+              decoded = base64.b64decode(compact, validate=True)
+              if base64.b64encode(decoded).decode("ascii") != compact:
+                  raise ValueError("non-canonical heartbeat encoding")
+              heartbeat_text = decoded.decode("ascii")
               if not re.fullmatch(r"\d{4}-\d{2}-\d{2}\n", heartbeat_text):
                   raise ValueError("heartbeat format")
               current_day = datetime.strptime(heartbeat_text, "%Y-%m-%d\n").date()
-          except (UnicodeDecodeError, ValueError) as exc:
+          except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
               raise SystemExit("invalid heartbeat value") from exc
 
           today = datetime.now(timezone.utc).date()
@@ -484,6 +493,7 @@ jobs:
             "$work_dir/final-heartbeat.json" "$work_dir/status-payload.json" \
             "$work_dir/final-combined.json" "$ref_update_rc" <<'PY'
           import base64
+          import binascii
           from datetime import datetime
           import json
           import re
@@ -511,11 +521,19 @@ jobs:
           if branch.get("commit", {}).get("sha") != new_sha:
               raise SystemExit(f"state branch update verification failed; patch_rc={update_rc}")
           encoded = heartbeat.get("content")
-          if not isinstance(encoded, str):
+          if (
+              not isinstance(encoded, str)
+              or not encoded
+              or not re.fullmatch(r"[A-Za-z0-9+/=\r\n]+", encoded)
+          ):
               raise SystemExit("final heartbeat content missing")
           try:
-              value = base64.b64decode(encoded, validate=True).decode("ascii")
-          except (UnicodeDecodeError, ValueError) as exc:
+              compact = encoded.replace("\r", "").replace("\n", "")
+              decoded = base64.b64decode(compact, validate=True)
+              if base64.b64encode(decoded).decode("ascii") != compact:
+                  raise ValueError("non-canonical heartbeat encoding")
+              value = decoded.decode("ascii")
+          except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
               raise SystemExit("final heartbeat is invalid") from exc
           if value != f"{meta['today']}\n":
               raise SystemExit("final heartbeat date mismatch")
