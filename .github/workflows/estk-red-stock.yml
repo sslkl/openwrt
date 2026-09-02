@@ -91,6 +91,22 @@ jobs:
             return "$curl_rc"
           }
 
+          read_branch_sha() {
+            local input_path="$1"
+            python3 - "$input_path" <<'PY'
+          import json
+          import re
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              data = json.load(handle)
+          sha = data.get("commit", {}).get("sha")
+          if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise SystemExit("invalid branch response SHA")
+          print(sha)
+          PY
+          }
+
           api_root="https://api.github.com/repos/$GITHUB_REPOSITORY"
           api_get "$work_dir/branch.json" "$api_root/branches/$STATE_BRANCH"
           api_get "$work_dir/heartbeat.json" \
@@ -392,7 +408,7 @@ jobs:
           api_get "$work_dir/new-combined.json" "$api_root/commits/$new_sha/status"
           python3 - "$work_dir/status-payload.json" "$work_dir/status-response.json" \
             "$work_dir/status-http-code.txt" "$work_dir/new-combined.json" \
-            "$status_post_rc" "$new_sha" <<'PY'
+            "$status_post_rc" "$new_sha" "$work_dir/copied-status-meta.json" <<'PY'
           from datetime import datetime, timezone
           import json
           import re
@@ -404,6 +420,7 @@ jobs:
               combined_path,
               post_rc_text,
               new_sha,
+              copied_status_meta_path,
           ) = sys.argv[1:]
           with open(payload_path, encoding="utf-8") as handle:
               expected = json.load(handle)
@@ -463,6 +480,13 @@ jobs:
           if isinstance(latest_id, bool) or not isinstance(latest_id, int) or latest_id <= 0:
               raise SystemExit("new state status ID is invalid")
 
+          copied_status_meta = {
+              "id": latest_id,
+              "created_at": latest["created_at"],
+          }
+          with open(copied_status_meta_path, "w", encoding="utf-8") as handle:
+              json.dump(copied_status_meta, handle, separators=(",", ":"))
+
           if post_rc == 0 and http_success:
               with open(response_path, encoding="utf-8") as handle:
                   response = json.load(handle)
@@ -485,16 +509,36 @@ jobs:
           ref_update_rc=$?
           set -e
 
-          api_get "$work_dir/final-branch.json" "$api_root/branches/$STATE_BRANCH"
+          final_ref_ready=no
+          final_branch_sha=unknown
+          for retry_delay in 0 1 2 4 8 16; do
+            if [ "$retry_delay" -gt 0 ]; then
+              sleep "$retry_delay"
+            fi
+            api_get "$work_dir/final-branch.json" "$api_root/branches/$STATE_BRANCH"
+            final_branch_sha="$(read_branch_sha "$work_dir/final-branch.json")"
+            if [ "$final_branch_sha" = "$new_sha" ]; then
+              final_ref_ready=yes
+              break
+            fi
+            echo "Waiting for ESTK state ref propagation: expected=$new_sha branch=$final_branch_sha" >&2
+          done
+          if [ "$final_ref_ready" != "yes" ]; then
+            echo "ESTK state ref propagation did not converge: expected=$new_sha branch=$final_branch_sha" >&2
+            exit 1
+          fi
+
           api_get "$work_dir/final-heartbeat.json" \
-            "$api_root/contents/$STATE_HEARTBEAT_PATH?ref=$STATE_BRANCH"
-          api_get "$work_dir/final-combined.json" "$api_root/commits/$STATE_BRANCH/status"
+            "$api_root/contents/$STATE_HEARTBEAT_PATH?ref=$new_sha"
+          api_get "$work_dir/final-status-history.json" \
+            "$api_root/commits/$new_sha/statuses?per_page=100"
           python3 - "$new_sha" "$work_dir/meta.json" "$work_dir/final-branch.json" \
             "$work_dir/final-heartbeat.json" "$work_dir/status-payload.json" \
-            "$work_dir/final-combined.json" "$ref_update_rc" <<'PY'
+            "$work_dir/copied-status-meta.json" "$work_dir/final-status-history.json" \
+            "$ref_update_rc" <<'PY'
           import base64
           import binascii
-          from datetime import datetime
+          from datetime import datetime, timezone
           import json
           import re
           import sys
@@ -504,7 +548,8 @@ jobs:
               branch_path,
               heartbeat_path,
               status_payload_path,
-              combined_path,
+              copied_status_meta_path,
+              status_history_path,
               update_rc,
           ) = sys.argv[1:]
           with open(meta_path, encoding="utf-8") as handle:
@@ -515,8 +560,19 @@ jobs:
               heartbeat = json.load(handle)
           with open(status_payload_path, encoding="utf-8") as handle:
               expected_status = json.load(handle)
-          with open(combined_path, encoding="utf-8") as handle:
-              combined = json.load(handle)
+          with open(copied_status_meta_path, encoding="utf-8") as handle:
+              copied_status_meta = json.load(handle)
+          with open(status_history_path, encoding="utf-8") as handle:
+              status_history = json.load(handle)
+
+          copied_status_id = copied_status_meta.get("id")
+          copied_created_at = copied_status_meta.get("created_at")
+          if (
+              isinstance(copied_status_id, bool)
+              or not isinstance(copied_status_id, int)
+              or copied_status_id <= 0
+          ):
+              raise SystemExit("copied status metadata ID is invalid")
 
           if branch.get("commit", {}).get("sha") != new_sha:
               raise SystemExit(f"state branch update verification failed; patch_rc={update_rc}")
@@ -537,39 +593,136 @@ jobs:
               raise SystemExit("final heartbeat is invalid") from exc
           if value != f"{meta['today']}\n":
               raise SystemExit("final heartbeat date mismatch")
-          if combined.get("sha") != new_sha:
-              raise SystemExit("final combined status SHA mismatch")
-          statuses = combined.get("statuses")
-          if not isinstance(statuses, list):
-              raise SystemExit("final status list is invalid")
+
+          if not isinstance(status_history, list):
+              raise SystemExit("final status history is invalid")
+
+          uint_pattern = re.compile(r"^(?:0|[1-9][0-9]{0,9})$")
+          price_pattern = re.compile(r"^(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,4})?$")
+          allowed_events = {
+              "none",
+              "initialized",
+              "restocked",
+              "sold_out",
+              "monitor_failure",
+              "monitor_recovered",
+          }
+          allowed_reasons = {"invalid_or_stale_status", "source_fetch_failed"}
+
+          def parse_time(value, freshness=False):
+              if not isinstance(value, str) or not re.fullmatch(
+                  r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value
+              ):
+                  raise ValueError("time")
+              parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+                  tzinfo=timezone.utc
+              )
+              if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+                  raise ValueError("time")
+              if freshness:
+                  age = (datetime.now(timezone.utc) - parsed).total_seconds()
+                  if age > 7200 or age < -300:
+                      raise ValueError("stale")
+              return parsed
+
+          def token_value(token, prefix):
+              marker = f"{prefix}="
+              if not isinstance(token, str) or not token.startswith(marker):
+                  raise ValueError(prefix)
+              return token[len(marker):]
+
+          def parse_uint(value, field):
+              if not uint_pattern.fullmatch(value):
+                  raise ValueError(field)
+              return int(value)
+
+          def validate_status(item):
+              description = item.get("description")
+              if not isinstance(description, str) or len(description) > 140:
+                  raise ValueError("description")
+              tokens = description.split("|")
+              if item.get("state") == "success":
+                  if len(tokens) != 8 or tokens[0] != "ok":
+                      raise ValueError("success fields")
+                  stock = parse_uint(token_value(tokens[1], "stock"), "stock")
+                  parse_uint(token_value(tokens[2], "status"), "status")
+                  if token_value(tokens[3], "presale") not in {"true", "false"}:
+                      raise ValueError("presale")
+                  if not price_pattern.fullmatch(token_value(tokens[4], "price")):
+                      raise ValueError("price")
+                  parse_time(token_value(tokens[5], "checked"), freshness=True)
+                  event = token_value(tokens[6], "event")
+                  if event not in allowed_events or event == "monitor_failure":
+                      raise ValueError("event")
+                  sequence = parse_uint(token_value(tokens[7], "seq"), "seq")
+                  if event == "restocked" and stock == 0:
+                      raise ValueError("restocked stock")
+                  if event == "sold_out" and stock > 0:
+                      raise ValueError("sold_out stock")
+                  if event == "initialized" and sequence != 0:
+                      raise ValueError("initialized seq")
+              elif item.get("state") == "error":
+                  if len(tokens) != 6 or tokens[0] != "error":
+                      raise ValueError("error fields")
+                  failures = parse_uint(token_value(tokens[1], "failures"), "failures")
+                  if failures < 1:
+                      raise ValueError("failures")
+                  if token_value(tokens[2], "reason") not in allowed_reasons:
+                      raise ValueError("reason")
+                  parse_time(token_value(tokens[3], "checked"), freshness=True)
+                  event = token_value(tokens[4], "event")
+                  expected_event = "monitor_failure" if failures == 3 else "none"
+                  if event != expected_event:
+                      raise ValueError("event")
+                  parse_uint(token_value(tokens[5], "seq"), "seq")
+              else:
+                  raise ValueError("state")
+
           candidates = []
-          for item in statuses:
+          for item in status_history:
               if not isinstance(item, dict) or item.get("context") != expected_status["context"]:
                   continue
-              created_at = item.get("created_at")
-              if not isinstance(created_at, str) or not re.fullmatch(
-                  r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", created_at
-              ):
-                  raise SystemExit("final status creation time is invalid")
-              try:
-                  parsed = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
-              except ValueError as exc:
-                  raise SystemExit("final status creation time is invalid") from exc
               status_id = item.get("id")
               if isinstance(status_id, bool) or not isinstance(status_id, int) or status_id <= 0:
                   raise SystemExit("final status ID is invalid")
-              candidates.append((parsed, status_id, item))
+              try:
+                  created_at = parse_time(item.get("created_at"), freshness=True)
+              except (TypeError, ValueError) as exc:
+                  raise SystemExit("final status creation time is invalid") from exc
+              candidates.append((created_at, status_id, item))
           if not candidates:
               raise SystemExit("final status is missing")
-          latest = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
-          if (
-              latest.get("state") != expected_status["state"]
-              or latest.get("description") != expected_status["description"]
-          ):
-              raise SystemExit("final status does not match the copied status")
-          latest_id = latest.get("id")
-          if isinstance(latest_id, bool) or not isinstance(latest_id, int) or latest_id <= 0:
-              raise SystemExit("final status ID is invalid")
+
+          try:
+              copied_created = parse_time(copied_created_at)
+          except (TypeError, ValueError) as exc:
+              raise SystemExit("copied status metadata time is invalid") from exc
+          copied_key = (copied_created, copied_status_id)
+          copied_matches = [
+              item
+              for item in status_history
+              if isinstance(item, dict)
+              and item.get("id") == copied_status_id
+              and item.get("created_at") == copied_created_at
+              and item.get("context") == expected_status["context"]
+              and item.get("state") == expected_status["state"]
+              and item.get("description") == expected_status["description"]
+          ]
+          if len(copied_matches) != 1:
+              raise SystemExit("copied status is missing from final status history")
+
+          for created_at, status_id, item in candidates:
+              key = (created_at, status_id)
+              if status_id == copied_status_id:
+                  if key != copied_key:
+                      raise SystemExit("copied status ordering metadata changed")
+                  continue
+              if key <= copied_key:
+                  raise SystemExit("unexpected status predates the copied status")
+              try:
+                  validate_status(item)
+              except (TypeError, ValueError) as exc:
+                  raise SystemExit("newer final status is invalid") from exc
           PY
 
           echo "ESTK monitor state rotation verified: ${new_sha:0:12}"
