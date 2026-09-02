@@ -2,7 +2,7 @@ name: ESTK monitor state rotation
 
 on:
   schedule:
-    - cron: "17 0 * * *"
+    - cron: "17,47 * * * *"
   workflow_dispatch:
   push:
     branches:
@@ -25,6 +25,7 @@ jobs:
     env:
       STATE_BRANCH: estk-monitor-state
       STATE_HEARTBEAT_PATH: .estk-monitor-heartbeat
+      STATE_MIRROR_PATH: .estk-monitor-consumer.json
       STATUS_CONTEXT: estkme-red/oracle-monitor
     steps:
       - name: Prepare next state commit, copy status, and fast-forward branch
@@ -135,6 +136,7 @@ jobs:
             "$work_dir/git-commit.json" \
             "$work_dir/meta.json" \
             "$work_dir/blob-payload.json" \
+            "$work_dir/mirror-blob-payload.json" \
             "$work_dir/status-payload.json" <<'PY'
           import base64
           import binascii
@@ -150,6 +152,7 @@ jobs:
               commit_path,
               meta_path,
               blob_payload_path,
+              mirror_blob_payload_path,
               status_payload_path,
           ) = sys.argv[1:]
           sha_pattern = re.compile(r"^[0-9a-f]{40}$")
@@ -298,66 +301,89 @@ jobs:
           except (TypeError, ValueError) as exc:
               raise SystemExit("current ESTK status is invalid or stale") from exc
 
-          if current_day == today:
-              with open(meta_path, "w", encoding="utf-8") as handle:
-                  json.dump({"rotate": False}, handle, separators=(",", ":"))
-              raise SystemExit(0)
-
           status_payload = {
               "state": latest["state"],
               "context": "estkme-red/oracle-monitor",
               "description": description,
           }
+          mirrored_at = datetime.now(timezone.utc).replace(microsecond=0).strftime(
+              "%Y-%m-%dT%H:%M:%SZ"
+          )
+          mirror = {
+              "schema": 1,
+              "source": "github_commit_status",
+              "repository": "sslkl/openwrt",
+              "branch": "estk-monitor-state",
+              "source_sha": old_sha,
+              "mirrored_at": mirrored_at,
+              "status": {
+                  "id": latest["id"],
+                  "state": latest["state"],
+                  "context": "estkme-red/oracle-monitor",
+                  "description": description,
+                  "created_at": latest["created_at"],
+              },
+          }
+          mirror_text = json.dumps(mirror, separators=(",", ":"), sort_keys=True) + "\n"
           blob_payload = {"content": f"{today.isoformat()}\n", "encoding": "utf-8"}
+          mirror_blob_payload = {"content": mirror_text, "encoding": "utf-8"}
           meta = {
-              "rotate": True,
+              "advance": True,
               "old_sha": old_sha,
               "old_tree_sha": old_tree_sha,
               "today": today.isoformat(),
+              "mirrored_at": mirrored_at,
           }
           for path, payload in (
               (meta_path, meta),
               (blob_payload_path, blob_payload),
+              (mirror_blob_payload_path, mirror_blob_payload),
               (status_payload_path, status_payload),
           ):
               with open(path, "w", encoding="utf-8") as handle:
                   json.dump(payload, handle, separators=(",", ":"))
           PY
 
-          rotate="$(python3 - "$work_dir/meta.json" <<'PY'
-          import json
-          import sys
-          with open(sys.argv[1], encoding="utf-8") as handle:
-              print("yes" if json.load(handle).get("rotate") is True else "no")
-          PY
-          )"
-          if [ "$rotate" != "yes" ]; then
-            echo "ESTK monitor state already rotated for the current UTC day"
-            exit 0
-          fi
-
           api_write POST "$work_dir/blob-response.json" "$work_dir/blob-payload.json" \
             "$api_root/git/blobs"
-          python3 - "$work_dir/meta.json" "$work_dir/blob-response.json" "$work_dir/tree-payload.json" <<'PY'
+          api_write POST "$work_dir/mirror-blob-response.json" \
+            "$work_dir/mirror-blob-payload.json" "$api_root/git/blobs"
+          python3 - "$work_dir/meta.json" "$work_dir/blob-response.json" \
+            "$work_dir/mirror-blob-response.json" "$work_dir/tree-payload.json" <<'PY'
           import json
           import re
           import sys
-          meta_path, response_path, output_path = sys.argv[1:]
+          meta_path, response_path, mirror_response_path, output_path = sys.argv[1:]
           with open(meta_path, encoding="utf-8") as handle:
               meta = json.load(handle)
           with open(response_path, encoding="utf-8") as handle:
               response = json.load(handle)
+          with open(mirror_response_path, encoding="utf-8") as handle:
+              mirror_response = json.load(handle)
           blob_sha = response.get("sha")
           if not isinstance(blob_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
               raise SystemExit("invalid blob response")
+          mirror_blob_sha = mirror_response.get("sha")
+          if not isinstance(mirror_blob_sha, str) or not re.fullmatch(
+              r"[0-9a-f]{40}", mirror_blob_sha
+          ):
+              raise SystemExit("invalid mirror blob response")
           payload = {
               "base_tree": meta["old_tree_sha"],
-              "tree": [{
-                  "path": ".estk-monitor-heartbeat",
-                  "mode": "100644",
-                  "type": "blob",
-                  "sha": blob_sha,
-              }],
+              "tree": [
+                  {
+                      "path": ".estk-monitor-heartbeat",
+                      "mode": "100644",
+                      "type": "blob",
+                      "sha": blob_sha,
+                  },
+                  {
+                      "path": ".estk-monitor-consumer.json",
+                      "mode": "100644",
+                      "type": "blob",
+                      "sha": mirror_blob_sha,
+                  },
+              ],
           }
           with open(output_path, "w", encoding="utf-8") as handle:
               json.dump(payload, handle, separators=(",", ":"))
@@ -378,7 +404,7 @@ jobs:
           if not isinstance(tree_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", tree_sha):
               raise SystemExit("invalid tree response")
           payload = {
-              "message": f"Rotate ESTK monitor state {meta['today']}",
+              "message": f"Mirror ESTK monitor state {meta['mirrored_at']}",
               "tree": tree_sha,
               "parents": [meta["old_sha"]],
           }
@@ -530,10 +556,13 @@ jobs:
 
           api_get "$work_dir/final-heartbeat.json" \
             "$api_root/contents/$STATE_HEARTBEAT_PATH?ref=$new_sha"
+          api_get "$work_dir/final-mirror.json" \
+            "$api_root/contents/$STATE_MIRROR_PATH?ref=$new_sha"
           api_get "$work_dir/final-status-history.json" \
             "$api_root/commits/$new_sha/statuses?per_page=100"
           python3 - "$new_sha" "$work_dir/meta.json" "$work_dir/final-branch.json" \
-            "$work_dir/final-heartbeat.json" "$work_dir/status-payload.json" \
+            "$work_dir/final-heartbeat.json" "$work_dir/final-mirror.json" \
+            "$work_dir/mirror-blob-payload.json" "$work_dir/status-payload.json" \
             "$work_dir/copied-status-meta.json" "$work_dir/final-status-history.json" \
             "$ref_update_rc" <<'PY'
           import base64
@@ -547,6 +576,8 @@ jobs:
               meta_path,
               branch_path,
               heartbeat_path,
+              mirror_path,
+              mirror_blob_payload_path,
               status_payload_path,
               copied_status_meta_path,
               status_history_path,
@@ -558,6 +589,10 @@ jobs:
               branch = json.load(handle)
           with open(heartbeat_path, encoding="utf-8") as handle:
               heartbeat = json.load(handle)
+          with open(mirror_path, encoding="utf-8") as handle:
+              mirror = json.load(handle)
+          with open(mirror_blob_payload_path, encoding="utf-8") as handle:
+              expected_mirror_payload = json.load(handle)
           with open(status_payload_path, encoding="utf-8") as handle:
               expected_status = json.load(handle)
           with open(copied_status_meta_path, encoding="utf-8") as handle:
@@ -593,6 +628,30 @@ jobs:
               raise SystemExit("final heartbeat is invalid") from exc
           if value != f"{meta['today']}\n":
               raise SystemExit("final heartbeat date mismatch")
+
+          mirror_encoded = mirror.get("content")
+          if (
+              not isinstance(mirror_encoded, str)
+              or not mirror_encoded
+              or not re.fullmatch(r"[A-Za-z0-9+/=\r\n]+", mirror_encoded)
+          ):
+              raise SystemExit("final mirror content missing")
+          try:
+              mirror_compact = mirror_encoded.replace("\r", "").replace("\n", "")
+              mirror_decoded = base64.b64decode(mirror_compact, validate=True)
+              if base64.b64encode(mirror_decoded).decode("ascii") != mirror_compact:
+                  raise ValueError("non-canonical mirror base64")
+              mirror_text = mirror_decoded.decode("utf-8")
+          except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+              raise SystemExit("final mirror is invalid") from exc
+          if mirror_text != expected_mirror_payload.get("content"):
+              raise SystemExit("final mirror content mismatch")
+          try:
+              mirror_document = json.loads(mirror_text)
+          except json.JSONDecodeError as exc:
+              raise SystemExit("final mirror JSON is invalid") from exc
+          if json.dumps(mirror_document, separators=(",", ":"), sort_keys=True) + "\n" != mirror_text:
+              raise SystemExit("final mirror JSON is not canonical")
 
           if not isinstance(status_history, list):
               raise SystemExit("final status history is invalid")
