@@ -6,6 +6,7 @@ on:
     - cron: "27 * * * *"
     - cron: "42 * * * *"
     - cron: "57 * * * *"
+  status:
   workflow_dispatch:
   push:
     branches:
@@ -23,6 +24,10 @@ concurrency:
 
 jobs:
   rotate:
+    if: >-
+      github.event_name != 'status' ||
+      (github.event.context == 'estkme-red/oracle-monitor' &&
+       github.event.creator.login != 'github-actions[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 4
     env:
