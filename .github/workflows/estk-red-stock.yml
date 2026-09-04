@@ -439,10 +439,16 @@ jobs:
             "$work_dir/status-http-code.txt" "$api_root/statuses/$new_sha"
           status_post_rc=$?
           set -e
-          api_get "$work_dir/new-combined.json" "$api_root/commits/$new_sha/status"
-          python3 - "$work_dir/status-payload.json" "$work_dir/status-response.json" \
-            "$work_dir/status-http-code.txt" "$work_dir/new-combined.json" \
-            "$status_post_rc" "$new_sha" "$work_dir/copied-status-meta.json" <<'PY'
+          status_visible=false
+          for status_readback_delay in 0 1 2 4 8; do
+            if [ "$status_readback_delay" -gt 0 ]; then
+              sleep "$status_readback_delay"
+            fi
+            api_get "$work_dir/new-combined.json" "$api_root/commits/$new_sha/status"
+            set +e
+            python3 - "$work_dir/status-payload.json" "$work_dir/status-response.json" \
+              "$work_dir/status-http-code.txt" "$work_dir/new-combined.json" \
+              "$status_post_rc" "$new_sha" "$work_dir/copied-status-meta.json" <<'PY'
           from datetime import datetime, timezone
           import json
           import re
@@ -503,7 +509,7 @@ jobs:
                   raise SystemExit("new state status ID is invalid")
               candidates.append((parsed, status_id, item))
           if not candidates:
-              raise SystemExit(f"new state status verification failed; post_rc={post_rc}")
+              raise SystemExit(75)
           latest = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
           if latest.get("state") != expected["state"] or latest.get("description") != expected["description"]:
               raise SystemExit(
@@ -530,6 +536,20 @@ jobs:
               if latest_id != status_id:
                   raise SystemExit("created status ID is missing from readback")
           PY
+            status_verify_rc=$?
+            set -e
+            if [ "$status_verify_rc" -eq 0 ]; then
+              status_visible=true
+              break
+            fi
+            if [ "$status_verify_rc" -ne 75 ]; then
+              exit "$status_verify_rc"
+            fi
+          done
+          if [ "$status_visible" != true ]; then
+            echo "new state status was not visible after bounded readback" >&2
+            exit 1
+          fi
 
           python3 - "$new_sha" "$work_dir/ref-payload.json" <<'PY'
           import json
