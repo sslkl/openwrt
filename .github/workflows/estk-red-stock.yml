@@ -55,6 +55,7 @@ jobs:
               --header "Authorization: Bearer $GH_TOKEN" \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2026-03-10" \
+              --header "Cache-Control: no-cache" \
               --output "$output_path" \
               "$url"
           }
@@ -64,16 +65,25 @@ jobs:
             local output_path="$2"
             local payload_path="$3"
             local url="$4"
-            curl --fail-with-body --silent --show-error \
-              --request "$method" \
-              --connect-timeout 10 --max-time 30 \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2026-03-10" \
-              --header "Content-Type: application/json" \
-              --data-binary "@$payload_path" \
-              --output "$output_path" \
-              "$url"
+            local stage="${5:-unknown}"
+            local curl_rc
+            if curl --fail-with-body --silent --show-error \
+                --request "$method" \
+                --connect-timeout 10 --max-time 30 \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2026-03-10" \
+                --header "Content-Type: application/json" \
+                --data-binary "@$payload_path" \
+                --output "$output_path" \
+                "$url"; then
+              return 0
+            else
+              curl_rc=$?
+              printf 'GitHub API write failed: stage=%s method=%s curl_exit=%s\n' \
+                "$stage" "$method" "$curl_rc" >&2
+              return "$curl_rc"
+            fi
           }
 
           api_status_write() {
@@ -353,9 +363,10 @@ jobs:
           PY
 
           api_write POST "$work_dir/blob-response.json" "$work_dir/blob-payload.json" \
-            "$api_root/git/blobs"
+            "$api_root/git/blobs" "create-heartbeat-blob"
           api_write POST "$work_dir/mirror-blob-response.json" \
-            "$work_dir/mirror-blob-payload.json" "$api_root/git/blobs"
+            "$work_dir/mirror-blob-payload.json" "$api_root/git/blobs" \
+            "create-consumer-mirror-blob"
           python3 - "$work_dir/meta.json" "$work_dir/blob-response.json" \
             "$work_dir/mirror-blob-response.json" "$work_dir/tree-payload.json" <<'PY'
           import json
@@ -398,7 +409,7 @@ jobs:
           PY
 
           api_write POST "$work_dir/tree-response.json" "$work_dir/tree-payload.json" \
-            "$api_root/git/trees"
+            "$api_root/git/trees" "create-state-tree"
           python3 - "$work_dir/meta.json" "$work_dir/tree-response.json" "$work_dir/commit-payload.json" <<'PY'
           import json
           import re
@@ -421,7 +432,7 @@ jobs:
           PY
 
           api_write POST "$work_dir/commit-response.json" "$work_dir/commit-payload.json" \
-            "$api_root/git/commits"
+            "$api_root/git/commits" "create-state-commit"
           new_sha="$(python3 - "$work_dir/commit-response.json" <<'PY'
           import json
           import re
@@ -440,14 +451,15 @@ jobs:
           status_post_rc=$?
           set -e
           status_visible=false
-          for status_readback_delay in 0 1 2 4 8; do
+          for status_readback_delay in 0 1 2 4 8 16; do
             if [ "$status_readback_delay" -gt 0 ]; then
               sleep "$status_readback_delay"
             fi
-            api_get "$work_dir/new-combined.json" "$api_root/commits/$new_sha/status"
+            api_get "$work_dir/new-status-history.json" \
+              "$api_root/commits/$new_sha/statuses?per_page=100"
             set +e
             python3 - "$work_dir/status-payload.json" "$work_dir/status-response.json" \
-              "$work_dir/status-http-code.txt" "$work_dir/new-combined.json" \
+              "$work_dir/status-http-code.txt" "$work_dir/new-status-history.json" \
               "$status_post_rc" "$new_sha" "$work_dir/copied-status-meta.json" <<'PY'
           from datetime import datetime, timezone
           import json
@@ -457,20 +469,22 @@ jobs:
               payload_path,
               response_path,
               http_code_path,
-              combined_path,
+              status_history_path,
               post_rc_text,
               new_sha,
               copied_status_meta_path,
           ) = sys.argv[1:]
           with open(payload_path, encoding="utf-8") as handle:
               expected = json.load(handle)
-          with open(combined_path, encoding="utf-8") as handle:
-              combined = json.load(handle)
+          with open(status_history_path, encoding="utf-8") as handle:
+              statuses = json.load(handle)
 
           try:
               post_rc = int(post_rc_text)
           except ValueError as exc:
               raise SystemExit("invalid create-status exit code") from exc
+          if not re.fullmatch(r"[0-9a-f]{40}", new_sha):
+              raise SystemExit("invalid create-status SHA")
           try:
               with open(http_code_path, encoding="ascii") as handle:
                   http_code = int(handle.read().strip())
@@ -483,10 +497,6 @@ jobs:
           http_ambiguous = http_code == 429 or 500 <= http_code < 600
           if post_rc == 0 and not http_success and not http_ambiguous:
               raise SystemExit(f"create-status failed permanently; http_code={http_code}")
-          if combined.get("sha") != new_sha:
-              raise SystemExit("new combined status SHA mismatch")
-
-          statuses = combined.get("statuses")
           if not isinstance(statuses, list):
               raise SystemExit("new status list is invalid")
           candidates = []
@@ -559,7 +569,7 @@ jobs:
           PY
           set +e
           api_write PATCH "$work_dir/ref-response.json" "$work_dir/ref-payload.json" \
-            "$api_root/git/refs/heads/$STATE_BRANCH"
+            "$api_root/git/refs/heads/$STATE_BRANCH" "advance-state-ref"
           ref_update_rc=$?
           set -e
 
