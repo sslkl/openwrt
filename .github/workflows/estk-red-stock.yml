@@ -102,6 +102,7 @@ jobs:
               --header "X-GitHub-Api-Version: 2026-03-10" \
               --header "Content-Type: application/json" \
               --data-binary "@$payload_path" \
+              --dump-header "$output_path.headers" \
               --output "$output_path" \
               --write-out '%{http_code}' \
               "$url")"
@@ -496,7 +497,36 @@ jobs:
           http_success = 200 <= http_code < 300
           http_ambiguous = http_code == 429 or 500 <= http_code < 600
           if post_rc == 0 and not http_success and not http_ambiguous:
-              raise SystemExit(f"create-status failed permanently; http_code={http_code}")
+              diagnostic = f"create-status failed permanently; http_code={http_code}; sha={new_sha}"
+              try:
+                  with open(response_path + ".headers", encoding="ascii", errors="replace") as handle:
+                      ids = re.findall(
+                          r"^x-github-request-id:[ \t]*([0-9a-f:]{8,80})[ \t]*$",
+                          handle.read(16384), re.I | re.M,
+                      )
+                  if ids:
+                      diagnostic += f"; request_id={ids[-1]}"
+              except OSError:
+                  pass
+              if http_code == 422:
+                  try:
+                      with open(response_path, encoding="utf-8") as handle:
+                          response = json.load(handle)
+                  except (OSError, ValueError):
+                      response = {}
+                  errors = response.get("errors") if isinstance(response, dict) else None
+                  details = []
+                  for error in errors[:5] if isinstance(errors, list) else []:
+                      if not isinstance(error, dict):
+                          continue
+                      field, code = error.get("field"), error.get("code")
+                      if field in ("sha", "state", "context", "description", "target_url") and code in (
+                          "invalid", "missing", "missing_field", "already_exists", "unprocessable", "custom",
+                      ):
+                          details.append(f"{field}:{code}")
+                  if details:
+                      diagnostic += "; validation=" + ",".join(details)
+              raise SystemExit(diagnostic)
           if not isinstance(statuses, list):
               raise SystemExit("new status list is invalid")
           candidates = []
@@ -596,13 +626,12 @@ jobs:
             "$api_root/contents/$STATE_HEARTBEAT_PATH?ref=$new_sha"
           api_get "$work_dir/final-mirror.json" \
             "$api_root/contents/$STATE_MIRROR_PATH?ref=$new_sha"
-          api_get "$work_dir/final-status-history.json" \
-            "$api_root/commits/$new_sha/statuses?per_page=100"
-          python3 - "$new_sha" "$work_dir/meta.json" "$work_dir/final-branch.json" \
-            "$work_dir/final-heartbeat.json" "$work_dir/final-mirror.json" \
-            "$work_dir/mirror-blob-payload.json" "$work_dir/status-payload.json" \
-            "$work_dir/copied-status-meta.json" "$work_dir/final-status-history.json" \
-            "$ref_update_rc" <<'PY'
+          verify_final_state() {
+            python3 - "$new_sha" "$work_dir/meta.json" "$work_dir/final-branch.json" \
+              "$work_dir/final-heartbeat.json" "$work_dir/final-mirror.json" \
+              "$work_dir/mirror-blob-payload.json" "$work_dir/status-payload.json" \
+              "$work_dir/copied-status-meta.json" "$work_dir/final-status-history.json" \
+              "$ref_update_rc" <<'PY'
           import base64
           import binascii
           from datetime import datetime, timezone
@@ -787,32 +816,23 @@ jobs:
               except (TypeError, ValueError) as exc:
                   raise SystemExit("final status creation time is invalid") from exc
               candidates.append((created_at, status_id, item))
-          if not candidates:
-              raise SystemExit("final status is missing")
-
           try:
               copied_created = parse_time(copied_created_at)
           except (TypeError, ValueError) as exc:
               raise SystemExit("copied status metadata time is invalid") from exc
           copied_key = (copied_created, copied_status_id)
-          copied_matches = [
-              item
-              for item in status_history
-              if isinstance(item, dict)
-              and item.get("id") == copied_status_id
-              and item.get("created_at") == copied_created_at
-              and item.get("context") == expected_status["context"]
-              and item.get("state") == expected_status["state"]
-              and item.get("description") == expected_status["description"]
-          ]
-          if len(copied_matches) != 1:
-              raise SystemExit("copied status is missing from final status history")
-
+          copied_seen = False
           for created_at, status_id, item in candidates:
               key = (created_at, status_id)
               if status_id == copied_status_id:
-                  if key != copied_key:
-                      raise SystemExit("copied status ordering metadata changed")
+                  if (
+                      copied_seen
+                      or key != copied_key
+                      or item.get("state") != expected_status["state"]
+                      or item.get("description") != expected_status["description"]
+                  ):
+                      raise SystemExit("copied status does not match prior readback")
+                  copied_seen = True
                   continue
               if key <= copied_key:
                   raise SystemExit("unexpected status predates the copied status")
@@ -820,6 +840,26 @@ jobs:
                   validate_status(item)
               except (TypeError, ValueError) as exc:
                   raise SystemExit("newer final status is invalid") from exc
+          if not copied_seen:
+              raise SystemExit(75)
           PY
+          }
 
-          echo "ESTK monitor state rotation verified: ${new_sha:0:12}"
+          for final_status_delay in 0 1 2 4 8 16; do
+            if [ "$final_status_delay" -gt 0 ]; then
+              sleep "$final_status_delay"
+            fi
+            api_get "$work_dir/final-status-history.json" \
+              "$api_root/commits/$new_sha/statuses?per_page=100"
+            if verify_final_state; then
+              echo "ESTK monitor state rotation verified: ${new_sha:0:12}"
+              exit 0
+            else
+              final_status_rc=$?
+            fi
+            if [ "$final_status_rc" -ne 75 ]; then
+              exit "$final_status_rc"
+            fi
+          done
+          echo "copied status was not visible after bounded final readback" >&2
+          exit 1
